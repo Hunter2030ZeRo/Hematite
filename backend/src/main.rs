@@ -120,8 +120,13 @@ async fn dispatch(state: &AppState, req: RpcRequest) -> RpcResponse {
                 return RpcResponse::err(req.id, -32602, "invalid params for workspace/open");
             };
 
-            state.workspace.open(params.path.clone(), params.content).await;
-            let _ = state.events.send(json!({"type":"fileOpened", "path": params.path}));
+            state
+                .workspace
+                .open(params.path.clone(), params.content)
+                .await;
+            let _ = state
+                .events
+                .send(json!({"type":"fileOpened", "path": params.path}));
             RpcResponse::ok(req.id, json!({"success": true}))
         }
         "workspace/save" => {
@@ -129,22 +134,34 @@ async fn dispatch(state: &AppState, req: RpcRequest) -> RpcResponse {
                 return RpcResponse::err(req.id, -32602, "invalid params for workspace/save");
             };
 
-            state.workspace.save(params.path.clone(), params.content).await;
-            let _ = state.events.send(json!({"type":"fileSaved", "path": params.path}));
+            state
+                .workspace
+                .save(params.path.clone(), params.content)
+                .await;
+            let _ = state
+                .events
+                .send(json!({"type":"fileSaved", "path": params.path}));
             RpcResponse::ok(req.id, json!({"success": true}))
         }
         "workspace/read" => {
-            let path = req.params.get("path").and_then(Value::as_str).unwrap_or_default();
+            let path = req
+                .params
+                .get("path")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let content = state.workspace.get(path).await.unwrap_or_default();
             RpcResponse::ok(req.id, json!({"path": path, "content": content}))
         }
         "extensions/install" => {
-            let Ok(params) = serde_json::from_value::<InstallExtensionParams>(req.params.clone()) else {
+            let Ok(params) = serde_json::from_value::<InstallExtensionParams>(req.params.clone())
+            else {
                 return RpcResponse::err(req.id, -32602, "invalid params for extensions/install");
             };
 
             let extension = state.extensions.install(params).await;
-            let _ = state.events.send(json!({"type":"extensionInstalled", "extension": extension}));
+            let _ = state
+                .events
+                .send(json!({"type":"extensionInstalled", "extension": extension}));
             RpcResponse::ok(req.id, json!({"extension": extension}))
         }
         "extensions/list" => {
@@ -154,11 +171,12 @@ async fn dispatch(state: &AppState, req: RpcRequest) -> RpcResponse {
         "capabilities" => RpcResponse::ok(
             req.id,
             json!({
-                "vscode_compat": {
-                    "extension_host": "planned",
+                "hematite_ecosystem": {
+                    "agent_runtime": "planned",
+                    "language_support": ["python", "rust", "c/c++", "cuda", "dart/flutter"],
                     "lsp": true,
                     "dap": true,
-                    "theme_api": "planned"
+                    "packaging_targets": ["linux-deb", "macos-dmg", "windows-msi", "windows-exe"]
                 },
                 "transport": "json-rpc-over-websocket"
             }),
