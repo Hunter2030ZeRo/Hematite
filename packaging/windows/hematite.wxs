@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="Hematite IDE" Language="1033" Version="$(var.Version)" Manufacturer="Hematite" UpgradeCode="12345678-1234-1234-1234-123456789abc">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" />
+    <MediaTemplate />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFilesFolder">
+        <Directory Id="INSTALLFOLDER" Name="HematiteIDE" />
+      </Directory>
+    </Directory>
+
+    <DirectoryRef Id="INSTALLFOLDER">
+      <Component Id="MainExecutable" Guid="*">
+        <File Source="../../frontend/build/windows/x64/runner/Release/hematite_editor.exe" KeyPath="yes" />
+      </Component>
+      <Component Id="BackendExecutable" Guid="*">
+        <File Source="../../frontend/build/windows/x64/runner/Release/hematite-backend.exe" KeyPath="yes" />
+      </Component>
+    </DirectoryRef>
+
+    <Feature Id="MainFeature" Title="Hematite IDE" Level="1">
+      <ComponentRef Id="MainExecutable" />
+      <ComponentRef Id="BackendExecutable" />
+    </Feature>
+  </Product>
+</Wix>
