@@ -1,12 +1,23 @@
 # Hematite
 
-Hematite is a full-stack, VS Code-inspired editor/IDE prototype with:
+Hematite is a cross-platform text editor/IDE built with a Flutter frontend and a Rust backend, targeting Windows, macOS, and Linux.
 
-- **Frontend**: Flutter desktop/web UI.
-- **Backend**: Rust service exposing JSON-RPC over WebSocket.
-- **Compatibility goal**: VS Code-style extension workflows (starting with extension metadata + install lifecycle, then extension host execution).
+Hematite is designed as a native desktop app for each OS, with distribution artifacts for:
 
-> This repository now contains a runnable MVP foundation rather than a complete parity implementation of VS Code.
+- **Linux**: `.deb`
+- **macOS**: `.dmg`
+- **Windows**: `.exe` / `.msi`
+
+Release builds are intended to be uploaded to the GitHub Releases tab for end-user installation.
+
+## Product direction
+
+Hematite focuses on its own ecosystem. The core direction is:
+
+- **Native UX + low overhead**: fast startup, low idle CPU, and a small memory footprint.
+- **Language support**: first-class tooling for Python, Rust, C/C++, CUDA, and Dart/Flutter.
+- **AI agent workflows**: Codex, Gemini CLI, and Claude Code integrations.
+- **Flutter + Rust split**: responsive Flutter desktop UI with performance-critical services in Rust.
 
 ## Project layout
 
@@ -43,13 +54,5 @@ flutter run -d linux
 - `extensions/install`
 - `extensions/list`
 - `capabilities`
-
-## VS Code compatibility strategy
-
-Hematite's backend is deliberately designed around JSON-RPC to align with:
-
-- Language Server Protocol (LSP)
-- Debug Adapter Protocol (DAP)
-- Extension-host-style command/event exchange
 
 See `docs/architecture.md` for the phased roadmap.

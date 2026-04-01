@@ -4,7 +4,8 @@
 
 1. Deliver a cross-platform editor UI via Flutter.
 2. Keep backend performance-critical services in Rust.
-3. Support VS Code extensions incrementally via compatible protocols and package formats.
+3. Build Hematite's own ecosystem for language tooling and AI-assisted workflows.
+4. Ship native installable artifacts for Linux (`.deb`), macOS (`.dmg`), and Windows (`.exe`/`.msi`) via Releases.
 
 ## High-level design
 
@@ -18,7 +19,7 @@
               │                                                           │
               │                                                           │
               ▼                                                           ▼
-      Monaco/Code widgets                                      LSP / DAP / Extension host
+      Desktop editor widgets                                   Language services / Agent runtime
       (incremental upgrades)                                   adapters (roadmap)
 ```
 
@@ -29,28 +30,29 @@
 - `extensions.rs`: extension metadata/install registry.
 - `main.rs`: WebSocket server, dispatch loop, event fan-out.
 
-## Compatibility roadmap
+## Ecosystem roadmap
 
 ### Phase 1 (present)
 
 - Workspace open/read/save operations.
 - Extension metadata install/list workflow.
 - Capability declaration endpoint.
+- Baseline JSON-RPC transport between UI and backend.
 
 ### Phase 2
 
-- Open VSX package download and unpack.
-- Manifest validation (`package.json` contribution points).
+- Language tooling integration for Python, Rust, C/C++, CUDA, and Dart/Flutter.
 - Command registry + UI contribution hydration.
+- Packaging pipeline for `.deb`, `.dmg`, and Windows installer artifacts.
 
 ### Phase 3
 
-- Sandboxed extension host runtime.
-- VS Code extension API subset (`commands`, `window`, `workspace`).
-- IPC bridge between extension host and Flutter UI.
+- Sandboxed plugin/agent runtime for Hematite ecosystem packages.
+- AI agent orchestration for Codex CLI, Gemini CLI, and Claude Code.
+- IPC bridge between runtime services and Flutter UI.
 
 ### Phase 4
 
 - Full LSP client orchestration in Rust.
 - DAP session lifecycle and debug UI.
-- Theme/tokenization parity and settings sync.
+- Lightweight theme/tokenization system and settings sync.
