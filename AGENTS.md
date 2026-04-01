@@ -531,6 +531,44 @@ When multiple designs are possible, prefer the one that best satisfies this orde
 
 Cleverness is the lowest priority.
 
+## Project management policy
+
+Hematite uses `uv` as the canonical Python project manager.
+For Python projects, agents should prefer `uv` for:
+
+- environment creation
+- dependency synchronization
+- Python version management
+- lockfile-aware project setup
+- command execution
+
+Do not introduce parallel Python environment managers unless explicitly required.
+
+For Node and Rust projects, Hematite should detect and interoperate with the ecosystem-native tools (`npm`/`pnpm`/`yarn`, `cargo`) rather than replacing them.
+
+## AI agent policy
+
+Hematite does not attempt to reimplement a monolithic coding model.
+Instead, it orchestrates external coding agents as first-class tools.
+
+Supported agent integrations for Hematite 1.0:
+
+- Codex CLI
+- Gemini CLI
+- Claude Code
+
+The IDE should provide:
+
+- agent selection
+- task routing
+- project-context-aware invocation
+- result streaming
+- diff preview
+- command approval surfaces
+- cancellation and retry controls
+
+The backend should treat these agents as external executables or services, not as embedded ad hoc logic.
+
 ---
 
 # 16. What agents should optimize for
