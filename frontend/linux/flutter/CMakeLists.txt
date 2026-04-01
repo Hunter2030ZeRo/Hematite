@@ -1,0 +1,35 @@
+cmake_minimum_required(VERSION 3.13)
+
+set(EPHEMERAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ephemeral")
+
+include(${EPHEMERAL_DIR}/generated_config.cmake)
+
+if(FLUTTER_TARGET_PLATFORM_SYSROOT)
+  set(CMAKE_SYSROOT ${FLUTTER_TARGET_PLATFORM_SYSROOT})
+  set(CMAKE_FIND_ROOT_PATH ${CMAKE_SYSROOT})
+  set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+  set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE ONLY)
+  set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
+  set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
+endif()
+
+set(WRAPPER_ROOT "${EPHEMERAL_DIR}/cpp_client_wrapper")
+
+if(EXISTS "${WRAPPER_ROOT}/CMakeLists.txt")
+  add_subdirectory(${WRAPPER_ROOT} ephemeral_wrapper)
+endif()
+
+set(FLUTTER_LIBRARY "flutter_linux")
+set(FLUTTER_EPHEMERAL_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ephemeral")
+
+add_library(flutter INTERFACE)
+target_include_directories(flutter INTERFACE "${FLUTTER_EPHEMERAL_DIR}")
+target_link_libraries(flutter INTERFACE "${FLUTTER_LIBRARY}")
+
+include(${FLUTTER_EPHEMERAL_DIR}/generated_plugins.cmake)
+
+set(FLUTTER_LIBRARY ${FLUTTER_LIBRARY} PARENT_SCOPE)
+set(FLUTTER_ICU_DATA_FILE "${FLUTTER_EPHEMERAL_DIR}/icudtl.dat" PARENT_SCOPE)
+set(PROJECT_BUILD_DIR "${PROJECT_DIR}/build/linux/${CMAKE_BUILD_TYPE}" PARENT_SCOPE)
+set(AOT_LIBRARY "${PROJECT_DIR}/build/linux/${CMAKE_BUILD_TYPE}/lib/libapp.so" PARENT_SCOPE)
+set(FLUTTER_ASSET_DIR_NAME "flutter_assets" PARENT_SCOPE)
