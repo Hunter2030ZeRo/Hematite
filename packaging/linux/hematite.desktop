@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Hematite IDE
+Comment=Flutter + Rust editor with VS Code compatibility roadmap
+Exec=/opt/hematite/hematite
+Icon=hematite
+Terminal=false
+Categories=Development;IDE;
