@@ -2,7 +2,7 @@
 
 ## Goals
 
-1. Deliver a cross-platform editor UI via Flutter (Linux desktop runner committed in-repo).
+1. Deliver a cross-platform editor UI via Flutter.
 2. Keep backend performance-critical services in Rust.
 3. Support VS Code extensions incrementally via compatible protocols and package formats.
 
