@@ -32,12 +32,7 @@ class _EditorScreenState extends State<EditorScreen> {
   final _extensionController = TextEditingController(text: 'rust-analyzer');
   final _editorController = TextEditingController();
 
-  static const _backendUrl = String.fromEnvironment(
-    'HEMATITE_BACKEND_WS',
-    defaultValue: 'ws://127.0.0.1:8989/rpc',
-  );
-
-  final _client = BackendClient(endpoint: Uri.parse(_backendUrl));
+  final _client = BackendClient(endpoint: Uri.parse('ws://127.0.0.1:8989/rpc'));
   final List<String> _log = [];
 
   @override

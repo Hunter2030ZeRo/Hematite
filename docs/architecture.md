@@ -2,7 +2,7 @@
 
 ## Goals
 
-1. Deliver a cross-platform editor UI via Flutter (Linux desktop runner committed in-repo).
+1. Deliver a cross-platform editor UI via Flutter.
 2. Keep backend performance-critical services in Rust.
 3. Support VS Code extensions incrementally via compatible protocols and package formats.
 
@@ -54,11 +54,3 @@
 - Full LSP client orchestration in Rust.
 - DAP session lifecycle and debug UI.
 - Theme/tokenization parity and settings sync.
-
-## Packaging
-
-Release packaging scripts live under `packaging/` and generate single-file installers per platform:
-
-- Linux: `.deb` via `packaging/linux/package_deb.sh`
-- macOS: `.dmg` via `packaging/macos/package_dmg.sh`
-- Windows: `.msi` via `packaging/windows/package_msi.ps1`
