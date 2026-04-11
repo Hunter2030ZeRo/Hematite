@@ -46,3 +46,8 @@ Build production bundles:
 ```bash
 npm run tauri -- build
 ```
+
+## Prerequisites(Optional)
+
+- [astral-uv](https://github.com/astral-sh/uv) - Required for automatic Python project/package management.
+- [Codex CLI](https://github.com/openai/codex)/[Gemini CLI](https://github.com/google-gemini/gemini-cli)/[Claude Code](https://github.com/anthropics/claude-code) - Install in case you wish to use integrated agentic coding feature.
