@@ -1,58 +1,48 @@
 # Hematite
 
-Hematite is a cross-platform text editor/IDE built with a Flutter frontend and a Rust backend, targeting Windows, macOS, and Linux.
+Hematite is a lightweight desktop IDE built with a Rust backend and a SolidJS frontend on top of Tauri.
 
-Hematite is designed as a native desktop app for each OS, with distribution artifacts for:
+The current app focuses on:
 
-- **Linux**: `.deb`
-- **macOS**: `.dmg`
-- **Windows**: `.exe` / `.msi`
+- fast native startup and low overhead
+- a CodeMirror-based editor with Python-first semantic highlighting
+- integrated agent workflows for Codex, Gemini CLI, and Claude Code
+- tree-sitter powered outline and compact context generation
+- Python environment and dependency management with `uv`
 
-Release builds are intended to be uploaded to the GitHub Releases tab for end-user installation.
+## Stack
 
-## Product direction
+- `src-tauri/` - Rust backend and native desktop packaging
+- `src/` - SolidJS frontend
+- `CodeMirror` - editor runtime
+- `tree-sitter` - symbols, context compaction, Python semantic analysis
+- `astral-uv` - Python venv and package management
 
-Hematite focuses on its own ecosystem. The core direction is:
+## Current capabilities
 
-- **Native UX + low overhead**: fast startup, low idle CPU, and a small memory footprint.
-- **Language support**: first-class tooling for Python, Rust, C/C++, CUDA, and Dart/Flutter.
-- **AI agent workflows**: Codex, Gemini CLI, and Claude Code integrations.
-- **Flutter + Rust split**: responsive Flutter desktop UI with performance-critical services in Rust.
+- workspace browsing and multi-tab editing
+- agent chat and access management
+- internal terminal panel
+- Python missing-import scan with batch install through `uv`
+- semantic hover and token coloring for Python
+- Windows packaging to `.msi` and `.exe`
 
-## Project layout
+## Development
 
-- `frontend/` — Flutter editor UI.
-- `backend/` — Rust backend for workspace state + extension registry + RPC.
-- `docs/` — Architecture notes and roadmap.
-
-## Quick start
-
-### 1) Start backend
-
-```bash
-cd backend
-cargo run
-```
-
-Backend runs on `127.0.0.1:8989`.
-
-### 2) Start frontend
+Install dependencies:
 
 ```bash
-cd frontend
-flutter pub get
-flutter run -d linux
+npm install
 ```
 
-(Use your target device in place of `linux`.)
+Run the desktop app in development:
 
-## Current RPC methods
+```bash
+npm run tauri -- dev
+```
 
-- `workspace/open`
-- `workspace/save`
-- `workspace/read`
-- `extensions/install`
-- `extensions/list`
-- `capabilities`
+Build production bundles:
 
-See `docs/architecture.md` for the phased roadmap.
+```bash
+npm run tauri -- build
+```
