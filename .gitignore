@@ -3,5 +3,6 @@ dist
 .venv
 src-tauri/target
 target
+crates/hematite-ui-state/Cargo.lock
 *.log
 *.corrupt.bin

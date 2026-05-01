@@ -1,0 +1,12 @@
+[package]
+name = "hematite-slint"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+hematite-ui-state = { path = "../crates/hematite-ui-state" }
+slint = "1.16.1"
+
+[build-dependencies]
+slint-build = "1.16.1"
