@@ -1,6 +1,7 @@
 node_modules
 dist
 .venv
+.superpowers/
 src-tauri/target
 target
 crates/hematite-ui-state/Cargo.lock

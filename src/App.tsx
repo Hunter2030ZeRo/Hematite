@@ -67,6 +67,13 @@ type EditorHoverItem = {
   endColumn: number;
 };
 
+type EditorHoverRequest = {
+  path: string;
+  content: string;
+  line: number;
+  column: number;
+};
+
 type EditorSemanticsPayload = {
   tokens: EditorSemanticToken[];
   hoverItems: EditorHoverItem[];
@@ -84,6 +91,11 @@ type EditorDiagnostic = {
   column: number;
   severity: "error" | "warning" | "info" | string;
   message: string;
+};
+
+type CursorPosition = {
+  line: number;
+  column: number;
 };
 
 type PythonImportEvent = {
@@ -107,6 +119,7 @@ type CredentialSnapshot = {
   hasGeminiApiKey: boolean;
   hasGoogleApiKey: boolean;
   hasAnthropicApiKey: boolean;
+  hasKiloApiKey: boolean;
   googleCloudProject?: string | null;
   googleCloudLocation?: string | null;
   googleApplicationCredentials?: string | null;
@@ -139,12 +152,59 @@ type PythonEnvironmentStatus = {
   recommendedCommand: string;
 };
 
+type RustEnvironmentStatus = {
+  root: string;
+  cargoTomlExists: boolean;
+  rustToolchainFile?: string | null;
+  activeToolchain?: string | null;
+  installedToolchains: string[];
+  installedComponents: string[];
+  rustcVersion?: string | null;
+  cargoVersion?: string | null;
+  rustAnalyzerAvailable: boolean;
+  rustfmtAvailable: boolean;
+  clippyAvailable: boolean;
+  lldbAvailable: boolean;
+  codelldbAvailable: boolean;
+  summary: string;
+  recommendedCommand: string;
+};
+
+type CFamilyEnvironmentStatus = {
+  root: string;
+  cmakeListsExists: boolean;
+  compileCommandsExists: boolean;
+  clangdAvailable: boolean;
+  clangAvailable: boolean;
+  clangxxAvailable: boolean;
+  gccAvailable: boolean;
+  gxxAvailable: boolean;
+  msvcClAvailable: boolean;
+  cmakeAvailable: boolean;
+  ninjaAvailable: boolean;
+  makeAvailable: boolean;
+  nvccAvailable: boolean;
+  cudaGdbAvailable: boolean;
+  lldbAvailable: boolean;
+  codelldbAvailable: boolean;
+  clangdVersion?: string | null;
+  clangVersion?: string | null;
+  gccVersion?: string | null;
+  nvccVersion?: string | null;
+  summary: string;
+  recommendedCommand: string;
+};
+
 type ProcessOutcome = {
   success: boolean;
   command: string;
   stdout: string;
   stderr: string;
+  diagnostics?: EditorDiagnostic[];
 };
+
+type PythonToolingAction = "check" | "fixAll" | "format" | "organizeImports" | "typeCheck";
+type RustToolingAction = "check" | "clippy" | "format" | "test" | "build" | "doc" | "metadata";
 
 type TerminalCommandResponse = {
   success: boolean;
@@ -352,7 +412,7 @@ type ChatMessage = {
   approval?: AgentApproval;
 };
 
-type UtilityTab = "chat" | "access" | "project" | "outline";
+type UtilityTab = "chat" | "access" | "project" | "problems" | "outline";
 
 type CredentialsForm = {
   openaiApiKey: string;
@@ -362,6 +422,12 @@ type CredentialsForm = {
   googleCloudLocation: string;
   googleApplicationCredentials: string;
   anthropicApiKey: string;
+  kiloApiKey: string;
+};
+
+type AgentModelOption = {
+  id: string;
+  label: string;
 };
 
 type AgentDefinition = {
@@ -371,6 +437,7 @@ type AgentDefinition = {
   args: string[];
   description: string;
   promptMode?: "stdin" | "arg";
+  models?: AgentModelOption[];
 };
 
 const LazyCodeEditor = lazy(() => import("./components/CodeEditor"));
@@ -383,6 +450,13 @@ const AGENTS: AgentDefinition[] = [
     args: ["exec", "-", "--skip-git-repo-check"],
     promptMode: "stdin",
     description: "Fast repo-aware Codex execution with compact workspace context.",
+    models: [
+      { id: "gpt-5.5", label: "GPT-5.5" },
+      { id: "gpt-5.4", label: "GPT-5.4" },
+      { id: "gpt-5.4-mini", label: "GPT-5.4 Mini" },
+      { id: "gpt-5.3-codex", label: "GPT-5.3 Codex" },
+      { id: "gpt-5.2", label: "GPT-5.2" },
+    ],
   },
   {
     id: "gemini",
@@ -390,6 +464,12 @@ const AGENTS: AgentDefinition[] = [
     binary: "gemini",
     args: ["-p", "{prompt}"],
     description: "Gemini prompt mode with Google sign-in or API-key based access.",
+    models: [
+      { id: "", label: "Provider default" },
+      { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+      { id: "gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+      { id: "gemini-2.0-flash", label: "Gemini 2.0 Flash" },
+    ],
   },
   {
     id: "claude",
@@ -397,21 +477,72 @@ const AGENTS: AgentDefinition[] = [
     binary: "claude",
     args: ["-p", "{prompt}"],
     description: "Claude Code execution using the installed CLI and local credentials.",
+    models: [
+      { id: "", label: "Provider default" },
+      { id: "opus", label: "Opus" },
+      { id: "sonnet", label: "Sonnet" },
+    ],
+  },
+  {
+    id: "kilo",
+    label: "Kilo Code",
+    binary: "kilo",
+    args: ["run", "--auto", "{prompt}"],
+    description: "Kilo Code CLI agent flow with bundled binary fallback.",
+    models: [
+      { id: "", label: "Provider default" },
+      { id: "openai/gpt-5.5", label: "OpenAI GPT-5.5" },
+      { id: "openai/gpt-5.4", label: "OpenAI GPT-5.4" },
+      { id: "anthropic/sonnet", label: "Claude Sonnet" },
+      { id: "google/gemini-2.5-pro", label: "Gemini 2.5 Pro" },
+    ],
   },
 ];
 
 const DEFAULT_TOOLS: ToolStatus[] = [
   { id: "uv", label: "astral-uv", available: false, resolvedPath: null },
   { id: "python", label: "Python", available: false, resolvedPath: null },
+  { id: "ruff", label: "Ruff", available: false, resolvedPath: null },
+  { id: "ty", label: "ty", available: false, resolvedPath: null },
   { id: "codex", label: "OpenAI Codex", available: false, resolvedPath: null },
   { id: "gemini", label: "Gemini CLI", available: false, resolvedPath: null },
   { id: "claude", label: "Claude Code", available: false, resolvedPath: null },
+  { id: "kilo", label: "Kilo Code", available: false, resolvedPath: null },
+  { id: "rustup", label: "rustup", available: false, resolvedPath: null },
+  { id: "rustc", label: "Rust compiler", available: false, resolvedPath: null },
+  { id: "cargo", label: "Cargo", available: false, resolvedPath: null },
+  { id: "rustfmt", label: "rustfmt", available: false, resolvedPath: null },
+  { id: "cargo-clippy", label: "Clippy", available: false, resolvedPath: null },
+  { id: "rust-analyzer", label: "rust-analyzer", available: false, resolvedPath: null },
+  { id: "lldb", label: "LLDB", available: false, resolvedPath: null },
+  { id: "codelldb", label: "CodeLLDB", available: false, resolvedPath: null },
+  { id: "wasm-pack", label: "wasm-pack", available: false, resolvedPath: null },
+  { id: "cargo-nextest", label: "cargo-nextest", available: false, resolvedPath: null },
+  { id: "cargo-watch", label: "cargo-watch", available: false, resolvedPath: null },
+  { id: "cargo-audit", label: "cargo-audit", available: false, resolvedPath: null },
+  { id: "cargo-deny", label: "cargo-deny", available: false, resolvedPath: null },
+  { id: "cargo-expand", label: "cargo-expand", available: false, resolvedPath: null },
+  { id: "cargo-llvm-cov", label: "cargo-llvm-cov", available: false, resolvedPath: null },
+  { id: "clangd", label: "clangd", available: false, resolvedPath: null },
+  { id: "clang", label: "Clang", available: false, resolvedPath: null },
+  { id: "clang++", label: "Clang++", available: false, resolvedPath: null },
+  { id: "gcc", label: "GCC", available: false, resolvedPath: null },
+  { id: "g++", label: "G++", available: false, resolvedPath: null },
+  { id: "cl", label: "MSVC cl", available: false, resolvedPath: null },
+  { id: "cmake", label: "CMake", available: false, resolvedPath: null },
+  { id: "ninja", label: "Ninja", available: false, resolvedPath: null },
+  { id: "make", label: "Make", available: false, resolvedPath: null },
+  { id: "nvcc", label: "NVCC", available: false, resolvedPath: null },
+  { id: "cuda-gdb", label: "cuda-gdb", available: false, resolvedPath: null },
 ];
 
 const CODEX_AGENT_LABEL =
   AGENTS.find((agent) => agent.id === "codex")?.label ?? "OpenAI Codex";
 const GEMINI_AGENT_LABEL =
   AGENTS.find((agent) => agent.id === "gemini")?.label ?? "Gemini CLI";
+const DEFAULT_AGENT_MODELS = Object.fromEntries(
+  AGENTS.map((agent) => [agent.id, agent.models?.[0]?.id ?? ""])
+);
 
 const QUICK_PROMPTS = [
   "Explain the active file and call out the riskiest part.",
@@ -424,6 +555,10 @@ const EMPTY_EDITOR_SEMANTICS: EditorSemanticsPayload = {
   tokens: [],
   hoverItems: [],
 };
+
+function defaultAgentModel(agent: AgentDefinition) {
+  return agent.models?.[0] ?? null;
+}
 
 const PERSISTED_APP_STATE_KEY = "hematite.app-state.v1";
 const MAX_CACHED_DIRECTORY_COUNT = 18;
@@ -774,7 +909,8 @@ function approvalStateLabel(state: ApprovalState) {
 }
 
 function pythonPackageName(module: string) {
-  switch (module) {
+  const normalized = module.startsWith("import:") ? module.slice("import:".length) : module;
+  switch (normalized) {
     case "PIL":
       return "Pillow";
     case "bs4":
@@ -788,8 +924,12 @@ function pythonPackageName(module: string) {
     case "yaml":
       return "PyYAML";
     default:
-      return module;
+      return normalized;
   }
+}
+
+function pythonDiagnosticImportModule(module: string) {
+  return module.startsWith("import:") ? module.slice("import:".length) : null;
 }
 
 async function invokeCommand<T>(command: string, args?: Record<string, unknown>) {
@@ -831,6 +971,68 @@ function toCodeMirrorDiagnostics(diagnostics: EditorDiagnostic[]): Diagnostic[] 
     message: diagnostic.message,
     source: diagnostic.module,
   }));
+}
+
+function diagnosticSeverityRank(diagnostic: EditorDiagnostic) {
+  switch (diagnostic.severity) {
+    case "error":
+      return 0;
+    case "warning":
+      return 1;
+    case "info":
+      return 2;
+    default:
+      return 3;
+  }
+}
+
+function summarizeDiagnostics(diagnostics: EditorDiagnostic[]) {
+  let errors = 0;
+  let warnings = 0;
+  let info = 0;
+
+  for (const diagnostic of diagnostics) {
+    if (diagnostic.severity === "error") {
+      errors += 1;
+    } else if (diagnostic.severity === "warning") {
+      warnings += 1;
+    } else {
+      info += 1;
+    }
+  }
+
+  return {
+    errors,
+    warnings,
+    info,
+    total: diagnostics.length,
+  };
+}
+
+function diagnosticSourceLabel(module: string) {
+  if (module.startsWith("import:") || module.includes("unresolved")) {
+    return "ty";
+  }
+  if (/^[A-Z]\d{3,}$/.test(module) || module === "ruff") {
+    return "Ruff";
+  }
+  if (module.startsWith("E") && /\d/.test(module)) {
+    return "rustc";
+  }
+  return module || "tool";
+}
+
+function diagnosticBadgeTone(stats: ReturnType<typeof summarizeDiagnostics>) {
+  if (stats.errors) {
+    return "error";
+  }
+  if (stats.warnings) {
+    return "warning";
+  }
+  if (stats.info) {
+    return "info";
+  }
+  return "muted";
 }
 
 function resetLineJump(setter: (value: number | null) => void, line: number) {
@@ -909,6 +1111,11 @@ export default function App() {
   const [compactContext, setCompactContext] = createSignal("");
   const [isRefreshingContext, setIsRefreshingContext] = createSignal(false);
   const [jumpToLine, setJumpToLine] = createSignal<number | null>(null);
+  const [cursorPosition, setCursorPosition] = createSignal<CursorPosition>({
+    line: 1,
+    column: 1,
+  });
+  const [lineWrapping, setLineWrapping] = createSignal(true);
   const [isOpeningWorkspace, setIsOpeningWorkspace] = createSignal(false);
   const [isHydratingWorkspaceState, setIsHydratingWorkspaceState] = createSignal(false);
   const [utilityTab, setUtilityTab] = createSignal<UtilityTab>("chat");
@@ -928,6 +1135,10 @@ export default function App() {
   const [launchingAgentId, setLaunchingAgentId] = createSignal<string | null>(null);
   const [pythonEnvironment, setPythonEnvironment] =
     createSignal<PythonEnvironmentStatus | null>(null);
+  const [rustEnvironment, setRustEnvironment] =
+    createSignal<RustEnvironmentStatus | null>(null);
+  const [cFamilyEnvironment, setCFamilyEnvironment] =
+    createSignal<CFamilyEnvironmentStatus | null>(null);
   const [isPreparingPythonEnvironment, setIsPreparingPythonEnvironment] =
     createSignal(false);
   const [prepareOutcome, setPrepareOutcome] = createSignal<ProcessOutcome | null>(null);
@@ -941,11 +1152,21 @@ export default function App() {
   const [terminalHeight, setTerminalHeight] = createSignal(248);
   const [isInstallingMissingPackages, setIsInstallingMissingPackages] =
     createSignal(false);
+  const [runningPythonToolingAction, setRunningPythonToolingAction] =
+    createSignal<PythonToolingAction | null>(null);
+  const [pythonToolingOutcome, setPythonToolingOutcome] =
+    createSignal<ProcessOutcome | null>(null);
+  const [runningRustToolingAction, setRunningRustToolingAction] =
+    createSignal<RustToolingAction | null>(null);
+  const [rustToolingOutcome, setRustToolingOutcome] =
+    createSignal<ProcessOutcome | null>(null);
   const [isCreatingFile, setIsCreatingFile] = createSignal(false);
   const [newFileDraft, setNewFileDraft] = createSignal("");
 
   const [directories, setDirectories] = createStore<Record<string, DirectoryState>>({});
   const [documents, setDocuments] = createStore<Record<string, EditorDocument>>({});
+  const [selectedAgentModels, setSelectedAgentModels] =
+    createStore<Record<string, string>>(DEFAULT_AGENT_MODELS);
   const [credentialsForm, setCredentialsForm] = createStore<CredentialsForm>({
     openaiApiKey: "",
     geminiApiKey: "",
@@ -954,6 +1175,7 @@ export default function App() {
     googleCloudLocation: "",
     googleApplicationCredentials: "",
     anthropicApiKey: "",
+    kiloApiKey: "",
   });
 
   let shellRef: HTMLDivElement | undefined;
@@ -972,6 +1194,30 @@ export default function App() {
     toCodeMirrorDiagnostics(activeDocument()?.diagnostics ?? [])
   );
 
+  const activeDiagnostics = createMemo(() => activeDocument()?.diagnostics ?? []);
+
+  const activeDiagnosticStats = createMemo(() =>
+    summarizeDiagnostics(activeDiagnostics())
+  );
+
+  const activeDiagnosticsSorted = createMemo(() =>
+    [...activeDiagnostics()].sort(
+      (left, right) =>
+        diagnosticSeverityRank(left) - diagnosticSeverityRank(right) ||
+        left.line - right.line ||
+        left.column - right.column
+    )
+  );
+
+  const activeDiagnosticSources = createMemo(() => {
+    const counts = new Map<string, number>();
+    for (const diagnostic of activeDiagnostics()) {
+      const label = diagnosticSourceLabel(diagnostic.module);
+      counts.set(label, (counts.get(label) ?? 0) + 1);
+    }
+    return [...counts.entries()].map(([label, count]) => ({ label, count }));
+  });
+
   const selectedAgent = createMemo(
     () => AGENTS.find((agent) => agent.id === selectedAgentId()) ?? AGENTS[0]
   );
@@ -979,6 +1225,12 @@ export default function App() {
   const selectedAgentStatus = createMemo(() =>
     agentHealth()?.agents.find((agent) => agent.id === selectedAgentId())
   );
+
+  const selectedAgentModel = createMemo(() => {
+    const agent = selectedAgent();
+    const selectedModelId = selectedAgentModels[agent.id] ?? defaultAgentModel(agent)?.id ?? "";
+    return agent.models?.find((model) => model.id === selectedModelId) ?? defaultAgentModel(agent);
+  });
 
   const activeInstallEvents = createMemo(() => activeDocument()?.installEvents ?? []);
 
@@ -992,16 +1244,17 @@ export default function App() {
     const results: Array<{ module: string; package: string }> = [];
 
     for (const diagnostic of document.diagnostics) {
-      if (diagnostic.severity !== "error" || diagnostic.module === "uv") {
+      const importModule = pythonDiagnosticImportModule(diagnostic.module);
+      if (diagnostic.severity !== "error" || !importModule) {
         continue;
       }
-      if (seen.has(diagnostic.module)) {
+      if (seen.has(importModule)) {
         continue;
       }
-      seen.add(diagnostic.module);
+      seen.add(importModule);
       results.push({
-        module: diagnostic.module,
-        package: pythonPackageName(diagnostic.module),
+        module: importModule,
+        package: pythonPackageName(importModule),
       });
     }
 
@@ -1027,16 +1280,77 @@ export default function App() {
     );
   });
 
+  const isPythonToolingAvailable = createMemo(
+    () => Boolean(workspaceRoot() && activeDocument()?.language === "python")
+  );
+
+  const isRustToolingAvailable = createMemo(
+    () =>
+      Boolean(
+        workspaceRoot() &&
+          activeDocument()?.language === "rust" &&
+          rustEnvironment()?.cargoTomlExists
+      )
+  );
+
+  const isCFamilyDocumentActive = createMemo(() =>
+    ["c", "cpp", "cuda-cpp"].includes(activeDocument()?.language ?? "")
+  );
+
+  const rustToolStatus = createMemo(() => {
+    const byId = new Map(tools().map((tool) => [tool.id, tool]));
+    return [
+      "rustup",
+      "rustc",
+      "cargo",
+      "rustfmt",
+      "cargo-clippy",
+      "rust-analyzer",
+      "lldb",
+      "codelldb",
+      "wasm-pack",
+      "cargo-nextest",
+      "cargo-watch",
+      "cargo-audit",
+      "cargo-deny",
+      "cargo-expand",
+      "cargo-llvm-cov",
+    ]
+      .map((id) => byId.get(id))
+      .filter((tool): tool is ToolStatus => Boolean(tool));
+  });
+
+  const cFamilyToolStatus = createMemo(() => {
+    const byId = new Map(tools().map((tool) => [tool.id, tool]));
+    return [
+      "clangd",
+      "clang",
+      "clang++",
+      "gcc",
+      "g++",
+      "cl",
+      "cmake",
+      "ninja",
+      "make",
+      "nvcc",
+      "cuda-gdb",
+      "lldb",
+      "codelldb",
+    ]
+      .map((id) => byId.get(id))
+      .filter((tool): tool is ToolStatus => Boolean(tool));
+  });
+
   const pythonManagementSummary = createMemo(() => {
     const document = activeDocument();
     if (!workspaceRoot()) {
-      return "Open a workspace to scan Python imports.";
+      return "Open a workspace to run Ruff and ty for Python diagnostics.";
     }
     if (!document) {
-      return "Open a Python file and Hematite will collect unresolved imports as you type.";
+      return "Open a Python file and Hematite will collect Ruff/ty diagnostics as you type.";
     }
     if (document.language !== "python") {
-      return "Switch to a Python file to scan missing imports for batch installation.";
+      return "Switch to a Python file to scan Ruff/ty diagnostics and missing imports.";
     }
     if (!missingImports().length) {
       return "No unresolved third-party imports were detected in the active Python file.";
@@ -1044,6 +1358,44 @@ export default function App() {
     return `The active Python file has ${missingImports().length} unresolved third-party import${
       missingImports().length === 1 ? "" : "s"
     }. Review the list below, then install them together with one click.`;
+  });
+
+  const rustManagementSummary = createMemo(() => {
+    const document = activeDocument();
+    const environment = rustEnvironment();
+    if (!workspaceRoot()) {
+      return "Open a workspace to inspect Rust toolchains and run Cargo automation.";
+    }
+    if (!environment?.cargoTomlExists) {
+      return "Standalone Rust parser support is active. Open a Cargo package or workspace to enable rust-analyzer, Cargo checks, Clippy, tests, docs, and metadata.";
+    }
+    if (!document) {
+      return "Open a Rust file to use rust-analyzer hover, semantic coloring, rustfmt, and active-file diagnostics.";
+    }
+    if (document.language !== "rust") {
+      return "Switch to a Rust file to run Cargo diagnostics and rustfmt against the active source.";
+    }
+    return "Rust IDE support is active for the current file. Cargo actions run explicitly so Hematite stays quiet while idle.";
+  });
+
+  const cFamilyManagementSummary = createMemo(() => {
+    const document = activeDocument();
+    const environment = cFamilyEnvironment();
+    if (!workspaceRoot()) {
+      return "Open a workspace to inspect C/C++/CUDA toolchains and compile metadata.";
+    }
+    if (!environment?.compileCommandsExists) {
+      return "Standalone C-family parser support is active. Add compile_commands.json or CMake metadata to prepare clangd-backed project intelligence.";
+    }
+    if (!document) {
+      return "Open a C, C++, or CUDA file to use parser-backed hover, semantic coloring, and outline.";
+    }
+    if (!isCFamilyDocumentActive()) {
+      return "Switch to a C, C++, or CUDA file to inspect the active source with the C-family parser.";
+    }
+    return environment.clangdAvailable
+      ? "C-family parser support is active, with clangd and compile_commands.json detected for project-aware integration."
+      : "C-family parser support is active. Install clangd to use the detected compile database for project-aware language service features.";
   });
 
   const pythonInstallModeLabel = createMemo(() =>
@@ -1236,6 +1588,68 @@ export default function App() {
       setPythonEnvironment(status);
     } catch (error) {
       setStatus(`Could not inspect Python environment: ${String(error)}`);
+    }
+  }
+
+  async function refreshRustEnvironment(root: string | undefined = workspaceRoot()) {
+    if (!root) {
+      setRustEnvironment(null);
+      return;
+    }
+
+    try {
+      const status = await invokeCommand<RustEnvironmentStatus>(
+        "inspect_rust_environment",
+        { root }
+      );
+      setRustEnvironment(status);
+    } catch (error) {
+      setStatus(`Could not inspect Rust toolchains: ${String(error)}`);
+    }
+  }
+
+  async function refreshCFamilyEnvironment(root: string | undefined = workspaceRoot()) {
+    if (!root) {
+      setCFamilyEnvironment(null);
+      return;
+    }
+
+    try {
+      const status = await invokeCommand<CFamilyEnvironmentStatus>(
+        "inspect_c_family_environment",
+        { root }
+      );
+      setCFamilyEnvironment(status);
+    } catch (error) {
+      setStatus(`Could not inspect C/C++/CUDA toolchains: ${String(error)}`);
+    }
+  }
+
+  async function requestEditorHover(
+    request: EditorHoverRequest
+  ): Promise<EditorHoverItem | null> {
+    const root = workspaceRoot();
+    const language = activeDocument()?.language;
+    if (
+      !root ||
+      !activeDocument() ||
+      !["python", "rust", "c", "cpp", "cuda-cpp"].includes(language ?? "")
+    ) {
+      return null;
+    }
+
+    try {
+      return await invokeCommand<EditorHoverItem | null>("request_editor_hover", {
+        request: {
+          root,
+          filePath: request.path,
+          source: request.content,
+          line: request.line,
+          column: request.column,
+        },
+      });
+    } catch {
+      return null;
     }
   }
 
@@ -1583,6 +1997,9 @@ export default function App() {
   async function openBestInitialFile(root: string) {
     const preferredPaths = [
       joinPath(root, "src", "App.tsx"),
+      joinPath(root, "src", "main.rs"),
+      joinPath(root, "src", "lib.rs"),
+      joinPath(root, "src-tauri", "src", "lib.rs"),
       joinPath(root, "src", "main.py"),
       joinPath(root, "README.md"),
     ];
@@ -1649,6 +2066,10 @@ export default function App() {
     setSymbols([]);
     setJumpToLine(null);
     setPrepareOutcome(null);
+    setRustToolingOutcome(null);
+    setPythonToolingOutcome(null);
+    setRunningRustToolingAction(null);
+    setRunningPythonToolingAction(null);
     setTerminalEntries([]);
     setTerminalInput("");
     setTerminalCwd(trimmed);
@@ -1733,7 +2154,11 @@ export default function App() {
           if (workspaceRoot() !== root) {
             return;
           }
-          await refreshPythonEnvironment(root);
+          await Promise.all([
+            refreshPythonEnvironment(root),
+            refreshRustEnvironment(root),
+            refreshCFamilyEnvironment(root),
+          ]);
         })();
       }, 720);
       return true;
@@ -1825,6 +2250,7 @@ export default function App() {
             googleApplicationCredentials:
               credentialsForm.googleApplicationCredentials || undefined,
             anthropicApiKey: credentialsForm.anthropicApiKey || undefined,
+            kiloApiKey: credentialsForm.kiloApiKey || undefined,
           },
         }
       );
@@ -1835,6 +2261,7 @@ export default function App() {
       setCredentialsForm("geminiApiKey", "");
       setCredentialsForm("googleApiKey", "");
       setCredentialsForm("anthropicApiKey", "");
+      setCredentialsForm("kiloApiKey", "");
       setStatus("Updated local agent credentials for Hematite.");
     } catch (error) {
       setStatus(`Could not save credentials: ${String(error)}`);
@@ -2254,6 +2681,7 @@ export default function App() {
           includeCompactContext: includeCompactContext(),
           currentFile: activeDocument()?.path,
           content: activeDocument()?.content,
+          model: selectedAgentModel()?.id || undefined,
         },
       });
 
@@ -2351,6 +2779,7 @@ export default function App() {
           includeCompactContext: includeCompactContext(),
           currentFile: activeDocument()?.path,
           content: activeDocument()?.content,
+          model: selectedAgentModel()?.id || undefined,
         },
       });
 
@@ -2435,6 +2864,7 @@ export default function App() {
           includeCompactContext: includeCompactContext(),
           currentFile: activeDocument()?.path,
           content: activeDocument()?.content,
+          model: selectedAgentModel()?.id || undefined,
         },
       });
 
@@ -2540,6 +2970,130 @@ export default function App() {
     }
   }
 
+  async function runPythonTooling(action: PythonToolingAction) {
+    const document = activeDocument();
+    const root = workspaceRoot();
+    if (!root || !document || document.language !== "python") {
+      setStatus("Open a Python file before running Ruff or ty.");
+      return;
+    }
+
+    setRunningPythonToolingAction(action);
+    setStatus("Running Python tooling...");
+
+    try {
+      if (document.dirty) {
+        await saveActiveFile(document.path);
+      }
+
+      const outcome = await invokeCommand<ProcessOutcome>("run_python_tooling_action", {
+        request: {
+          root,
+          filePath: document.path,
+          action,
+        },
+      });
+      setPythonToolingOutcome(outcome);
+
+      if (
+        outcome.success &&
+        (action === "format" || action === "fixAll" || action === "organizeImports")
+      ) {
+        const refreshed = await invokeCommand<FileDocument>("read_file", { path: document.path });
+        if (documents[document.path]) {
+          setDocuments(document.path, {
+            ...documents[document.path],
+            ...refreshed,
+            savedContent: refreshed.content,
+            dirty: false,
+            diagnostics: [],
+            installEvents: [],
+          });
+        }
+      }
+
+      if (documents[document.path]) {
+        const response = await invokeCommand<PythonImportResponse>("analyze_python_imports", {
+          request: {
+            root,
+            filePath: document.path,
+            source: documents[document.path].content,
+            autoInstall: false,
+          },
+        });
+        if (documents[document.path]) {
+          setDocuments(document.path, "diagnostics", response.diagnostics);
+          setDocuments(document.path, "installEvents", response.events);
+        }
+      }
+
+      setStatus(
+        outcome.success
+          ? `Finished ${outcome.command}.`
+          : `${outcome.command} returned a non-zero exit status.`
+      );
+    } catch (error) {
+      setStatus(`Could not run Python tooling: ${String(error)}`);
+    } finally {
+      setRunningPythonToolingAction(null);
+    }
+  }
+
+  async function runRustTooling(action: RustToolingAction) {
+    const document = activeDocument();
+    const root = workspaceRoot();
+    if (!root || !document || document.language !== "rust") {
+      setStatus("Open a Rust file before running Cargo or rustfmt.");
+      return;
+    }
+
+    setRunningRustToolingAction(action);
+    setStatus("Running Rust tooling...");
+
+    try {
+      if (document.dirty) {
+        await saveActiveFile(document.path);
+      }
+
+      const outcome = await invokeCommand<ProcessOutcome>("run_rust_tooling_action", {
+        request: {
+          root,
+          filePath: document.path,
+          action,
+        },
+      });
+      setRustToolingOutcome(outcome);
+
+      if (outcome.success && action === "format") {
+        const refreshed = await invokeCommand<FileDocument>("read_file", { path: document.path });
+        if (documents[document.path]) {
+          setDocuments(document.path, {
+            ...documents[document.path],
+            ...refreshed,
+            savedContent: refreshed.content,
+            dirty: false,
+            diagnostics: documents[document.path].diagnostics,
+            installEvents: documents[document.path].installEvents,
+          });
+        }
+      }
+
+      if (documents[document.path] && outcome.diagnostics) {
+        setDocuments(document.path, "diagnostics", outcome.diagnostics);
+      }
+
+      setStatus(
+        outcome.success
+          ? `Finished ${outcome.command}.`
+          : `${outcome.command} returned a non-zero exit status.`
+      );
+    } catch (error) {
+      setStatus(`Could not run Rust tooling: ${String(error)}`);
+    } finally {
+      setRunningRustToolingAction(null);
+    }
+  }
+
   function closeTab(path: string) {
     const nextTabs = openTabs().filter((tab) => tab !== path);
     setOpenTabs(nextTabs);
@@ -2596,6 +3150,9 @@ export default function App() {
       case "view.focus_project":
         setUtilityTab("project");
         break;
+      case "view.focus_problems":
+        setUtilityTab("problems");
+        break;
       case "view.focus_outline":
         setUtilityTab("outline");
         break;
@@ -2612,6 +3169,12 @@ export default function App() {
         break;
     }
   }
+
+  createEffect(() => {
+    if (!activeDocument()) {
+      setCursorPosition({ line: 1, column: 1 });
+    }
+  });
 
   createEffect(() => {
     const document = activeDocument();
@@ -2669,7 +3232,7 @@ export default function App() {
           setEditorSemantics(EMPTY_EDITOR_SEMANTICS);
         }
       }
-    }, 170);
+    }, document.language === "python" ? 620 : 170);
 
     onCleanup(() => window.clearTimeout(timeout));
   });
@@ -2725,22 +3288,6 @@ export default function App() {
         }
       }
     }, 1000);
-
-    onCleanup(() => window.clearTimeout(timeout));
-  });
-
-  createEffect(() => {
-    const root = workspaceRoot();
-    const document = activeDocument();
-
-    if (!root || !includeCompactContext()) {
-      setCompactContext("");
-      return;
-    }
-
-    const timeout = window.setTimeout(() => {
-      void refreshCompactContext();
-    }, document ? 240 : 80);
 
     onCleanup(() => window.clearTimeout(timeout));
   });
@@ -2962,6 +3509,65 @@ export default function App() {
       </header>
 
       <div ref={gridRef} class="workbench-grid">
+        <nav class="activity-bar" aria-label="Primary workbench areas">
+          <button type="button" class="activity-item active" title="Explorer">
+            EX
+          </button>
+          <button
+            type="button"
+            class={`activity-item${utilityTab() === "chat" ? " active" : ""}`}
+            title="Agent Workflows"
+            onClick={() => setUtilityTab("chat")}
+          >
+            AI
+          </button>
+          <button
+            type="button"
+            class={`activity-item${utilityTab() === "access" ? " active" : ""}`}
+            title="Agent Access"
+            onClick={() => setUtilityTab("access")}
+          >
+            AC
+          </button>
+          <button
+            type="button"
+            class={`activity-item${utilityTab() === "project" ? " active" : ""}`}
+            title="Project Automation"
+            onClick={() => setUtilityTab("project")}
+          >
+            PK
+          </button>
+          <button
+            type="button"
+            class={`activity-item${utilityTab() === "problems" ? " active" : ""}`}
+            title="Problems"
+            onClick={() => setUtilityTab("problems")}
+          >
+            PR
+            <Show when={activeDiagnosticStats().total}>
+              <span class={`activity-badge ${diagnosticBadgeTone(activeDiagnosticStats())}`}>
+                {activeDiagnosticStats().total}
+              </span>
+            </Show>
+          </button>
+          <button
+            type="button"
+            class={`activity-item${utilityTab() === "outline" ? " active" : ""}`}
+            title="Outline"
+            onClick={() => setUtilityTab("outline")}
+          >
+            OL
+          </button>
+          <button
+            type="button"
+            class={`activity-item${isTerminalVisible() ? " active" : ""}`}
+            title="Terminal"
+            onClick={() => toggleTerminal()}
+          >
+            &gt;_
+          </button>
+        </nav>
+
         <aside class="explorer-pane">
           <div class="pane-header">
             <div>
@@ -3047,19 +3653,33 @@ export default function App() {
           <div class="tabs-bar">
             <div class="tabs">
               <For each={openTabs()}>
-                {(path) => (
-                  <div class={`tab${activeTab() === path ? " active" : ""}`}>
-                    <button type="button" class="tab-open" onClick={() => setActiveTab(path)}>
-                      <span class="tab-name">{basename(path)}</span>
-                      <Show when={documents[path]?.dirty}>
-                        <span class="tab-dirty">*</span>
-                      </Show>
-                    </button>
-                    <button type="button" class="tab-close" onClick={() => closeTab(path)}>
-                      x
-                    </button>
-                  </div>
-                )}
+                {(path) => {
+                  const tabStats = createMemo(() =>
+                    summarizeDiagnostics(documents[path]?.diagnostics ?? [])
+                  );
+
+                  return (
+                    <div class={`tab${activeTab() === path ? " active" : ""}`}>
+                      <button type="button" class="tab-open" onClick={() => setActiveTab(path)}>
+                        <span class="tab-name">{basename(path)}</span>
+                        <Show when={documents[path]?.dirty}>
+                          <span class="tab-dirty">*</span>
+                        </Show>
+                        <Show when={tabStats().total}>
+                          <span
+                            class={`tab-diagnostic-badge ${diagnosticBadgeTone(tabStats())}`}
+                            title={`${tabStats().errors} error(s), ${tabStats().warnings} warning(s)`}
+                          >
+                            {tabStats().errors || tabStats().warnings || tabStats().info}
+                          </span>
+                        </Show>
+                      </button>
+                      <button type="button" class="tab-close" onClick={() => closeTab(path)}>
+                        x
+                      </button>
+                    </div>
+                  );
+                }}
               </For>
             </div>
 
@@ -3067,13 +3687,43 @@ export default function App() {
               <Show when={activeDocument()}>
                 <span>{activeDocument()?.language}</span>
                 <span>{activeDocument()?.dirty ? "unsaved" : "saved"}</span>
+                <button
+                  type="button"
+                  class={`editor-tool-button${lineWrapping() ? " active" : ""}`}
+                  onClick={() => setLineWrapping((value) => !value)}
+                >
+                  Wrap
+                </button>
+                <button
+                  type="button"
+                  class={`editor-tool-button ${diagnosticBadgeTone(activeDiagnosticStats())}`}
+                  onClick={() => setUtilityTab("problems")}
+                >
+                  {activeDiagnosticStats().total
+                    ? `${activeDiagnosticStats().total} Problems`
+                    : "No Problems"}
+                </button>
               </Show>
             </div>
           </div>
 
           <div class="editor-breadcrumb">
             <Show when={activeDocument()} fallback={<span>No file selected</span>}>
-              <span>{activeDocument()?.path}</span>
+              <span class="breadcrumb-path">{activeDocument()?.path}</span>
+              <div class="editor-inline-actions">
+                <span>
+                  Ln {cursorPosition().line}, Col {cursorPosition().column}
+                </span>
+                <Show when={activeDiagnosticSources().length}>
+                  <For each={activeDiagnosticSources()}>
+                    {(source) => (
+                      <span class="source-chip">
+                        {source.label} {source.count}
+                      </span>
+                    )}
+                  </For>
+                </Show>
+              </div>
             </Show>
           </div>
 
@@ -3105,7 +3755,8 @@ export default function App() {
                   path={activeDocument()!.path}
                   diagnostics={activeCodeMirrorDiagnostics()}
                   semanticTokens={editorSemantics().tokens}
-                  hoverItems={editorSemantics().hoverItems}
+                  lineWrapping={lineWrapping()}
+                  onHover={requestEditorHover}
                   jumpToLine={jumpToLine()}
                   onChange={(value) => {
                     const path = activeTab();
@@ -3115,6 +3766,7 @@ export default function App() {
                     setDocuments(path, "content", value);
                     setDocuments(path, "dirty", value !== documents[path].savedContent);
                   }}
+                  onCursorChange={(line, column) => setCursorPosition({ line, column })}
                   onSave={() => void saveActiveFile()}
                 />
               </Suspense>
@@ -3129,7 +3781,7 @@ export default function App() {
               class={`utility-tab${utilityTab() === "chat" ? " active" : ""}`}
               onClick={() => setUtilityTab("chat")}
             >
-              Chat
+              Agents
             </button>
             <button
               type="button"
@@ -3144,6 +3796,18 @@ export default function App() {
               onClick={() => setUtilityTab("project")}
             >
               Project
+            </button>
+            <button
+              type="button"
+              class={`utility-tab${utilityTab() === "problems" ? " active" : ""}`}
+              onClick={() => setUtilityTab("problems")}
+            >
+              Problems
+              <Show when={activeDiagnosticStats().total}>
+                <span class={`utility-tab-badge ${diagnosticBadgeTone(activeDiagnosticStats())}`}>
+                  {activeDiagnosticStats().total}
+                </span>
+              </Show>
             </button>
             <button
               type="button"
@@ -3198,6 +3862,29 @@ export default function App() {
                               <span>Source: {status()?.authSource}</span>
                             </Show>
                           </div>
+
+                          <Show when={agent.models?.length}>
+                            <label class="model-select-field card-model-select">
+                              <span>Model</span>
+                              <select
+                                value={
+                                  selectedAgentModels[agent.id] ??
+                                  defaultAgentModel(agent)?.id ??
+                                  ""
+                                }
+                                onChange={(event) =>
+                                  setSelectedAgentModels(
+                                    agent.id,
+                                    event.currentTarget.value
+                                  )
+                                }
+                              >
+                                <For each={agent.models ?? []}>
+                                  {(model) => <option value={model.id}>{model.label}</option>}
+                                </For>
+                              </select>
+                            </label>
+                          </Show>
 
                           <div class="agent-card-actions">
                             <button
@@ -3341,6 +4028,21 @@ export default function App() {
                           }
                         />
                       </label>
+
+                      <label class="form-field">
+                        <span>Kilo API key</span>
+                        <input
+                          value={credentialsForm.kiloApiKey}
+                          placeholder={
+                            agentHealth()?.credentials.hasKiloApiKey
+                              ? "Already stored or provided via environment"
+                              : "KILO_API_KEY"
+                          }
+                          onInput={(event) =>
+                            setCredentialsForm("kiloApiKey", event.currentTarget.value)
+                          }
+                        />
+                      </label>
                     </div>
 
                     <button
@@ -3360,9 +4062,9 @@ export default function App() {
               <div class="chat-shell">
                 <div class="chat-toolbar">
                   <div>
-                    <div class="pane-title">Agent Chat</div>
+                    <div class="pane-title">Agent Workflows</div>
                     <div class="pane-caption">
-                      Real chat-style conversation view for Codex, Gemini, and Claude
+                      On-demand task handoff for Codex, Gemini, Claude, and Kilo
                     </div>
                   </div>
                   <button
@@ -3371,7 +4073,7 @@ export default function App() {
                     disabled={isRunningAgent()}
                     onClick={() => void startNewChat()}
                   >
-                    New chat
+                    New task
                   </button>
                 </div>
 
@@ -3400,6 +4102,27 @@ export default function App() {
                     }}
                   </For>
                 </div>
+
+                <Show when={selectedAgent().models?.length}>
+                  <div class="agent-model-bar">
+                    <label class="model-select-field prominent">
+                      <span>Model</span>
+                      <select
+                        value={selectedAgentModel()?.id ?? ""}
+                        onChange={(event) =>
+                          setSelectedAgentModels(
+                            selectedAgent().id,
+                            event.currentTarget.value
+                          )
+                        }
+                      >
+                        <For each={selectedAgent().models ?? []}>
+                          {(model) => <option value={model.id}>{model.label}</option>}
+                        </For>
+                      </select>
+                    </label>
+                  </div>
+                </Show>
 
                 <div class="chat-stream">
                   <Show when={selectedAgentStatus()?.authState !== "ready"}>
@@ -3686,13 +4409,19 @@ export default function App() {
                   <div>
                     <div class="pane-title">Project Automation</div>
                     <div class="pane-caption">
-                      Python environments, uv, and explicit dependency repair
+                      Python, Rust, C/C++/CUDA, toolchains, and explicit project actions
                     </div>
                   </div>
                   <button
                     type="button"
                     class="pane-button"
-                    onClick={() => void refreshPythonEnvironment()}
+                    onClick={() =>
+                      void Promise.all([
+                        refreshPythonEnvironment(),
+                        refreshRustEnvironment(),
+                        refreshCFamilyEnvironment(),
+                      ])
+                    }
                   >
                     Refresh
                   </button>
@@ -3702,6 +4431,253 @@ export default function App() {
                   <div class="status-card-title">Workspace</div>
                   <div class="status-card-copy text-wrap">
                     {workspaceRoot() || "No workspace selected"}
+                  </div>
+                </article>
+
+                <article class="status-card">
+                  <div class="status-card-head">
+                    <div class="status-card-title">C/C++/CUDA toolchains</div>
+                    <span
+                      class={`state-badge ${
+                        cFamilyEnvironment()?.compileCommandsExists ? "ready" : "warning"
+                      }`}
+                    >
+                      {cFamilyEnvironment()?.compileCommandsExists
+                        ? "compile DB"
+                        : "parser fallback"}
+                    </span>
+                  </div>
+
+                  <div class="status-card-copy">{cFamilyEnvironment()?.summary}</div>
+
+                  <div class="status-row-list">
+                    <div class="status-row">
+                      <span>C-family root</span>
+                      <strong>{cFamilyEnvironment()?.root || "-"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>compile_commands.json</span>
+                      <strong>
+                        {cFamilyEnvironment()?.compileCommandsExists ? "Yes" : "No"}
+                      </strong>
+                    </div>
+                    <div class="status-row">
+                      <span>CMakeLists.txt</span>
+                      <strong>{cFamilyEnvironment()?.cmakeListsExists ? "Yes" : "No"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Recommended</span>
+                      <strong>{cFamilyEnvironment()?.recommendedCommand ?? "-"}</strong>
+                    </div>
+                  </div>
+
+                  <div class="subsection-title">C-family tools</div>
+                  <div class="tool-status-grid">
+                    <For each={cFamilyToolStatus()}>
+                      {(tool) => (
+                        <div class={`pill${tool.available ? " available" : ""}`}>
+                          <span class="pill-dot" />
+                          <span>{tool.label}</span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </article>
+
+                <article class="status-card">
+                  <div class="status-card-head">
+                    <div class="status-card-title">C/C++/CUDA workflow</div>
+                    <span class={`state-badge ${isCFamilyDocumentActive() ? "ready" : "muted"}`}>
+                      {isCFamilyDocumentActive() ? "active" : "idle"}
+                    </span>
+                  </div>
+
+                  <div class="status-card-copy">{cFamilyManagementSummary()}</div>
+
+                  <div class="status-row-list">
+                    <div class="status-row">
+                      <span>Editor</span>
+                      <strong>Parser hover, semantic tokens, and outline</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Language service</span>
+                      <strong>
+                        {cFamilyEnvironment()?.compileCommandsExists &&
+                        cFamilyEnvironment()?.clangdAvailable
+                          ? "clangd metadata detected"
+                          : "clangd integration pending compile database"}
+                      </strong>
+                    </div>
+                    <div class="status-row">
+                      <span>CUDA</span>
+                      <strong>
+                        {cFamilyEnvironment()?.nvccAvailable
+                          ? "NVCC detected"
+                          : "Install CUDA Toolkit for nvcc"}
+                      </strong>
+                    </div>
+                  </div>
+                </article>
+
+                <article class="status-card">
+                  <div class="status-card-head">
+                    <div class="status-card-title">Rust toolchains</div>
+                    <span
+                      class={`state-badge ${
+                        rustEnvironment()?.cargoTomlExists ? "ready" : "warning"
+                      }`}
+                    >
+                      {rustEnvironment()?.cargoTomlExists ? "Cargo ready" : "No Cargo.toml"}
+                    </span>
+                  </div>
+
+                  <div class="status-card-copy">{rustEnvironment()?.summary}</div>
+
+                  <div class="status-row-list">
+                    <div class="status-row">
+                      <span>Rust root</span>
+                      <strong>{rustEnvironment()?.root || "-"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Active toolchain</span>
+                      <strong>{rustEnvironment()?.activeToolchain || "Not reported"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Toolchain file</span>
+                      <strong>{rustEnvironment()?.rustToolchainFile ? "Yes" : "No"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Recommended</span>
+                      <strong>{rustEnvironment()?.recommendedCommand ?? "-"}</strong>
+                    </div>
+                  </div>
+
+                  <div class="subsection-title">Installed toolchains</div>
+                  <Show
+                    when={rustEnvironment()?.installedToolchains.length}
+                    fallback={<div class="empty-note">No rustup toolchains reported.</div>}
+                  >
+                    <ul class="event-list compact-list">
+                      <For each={rustEnvironment()?.installedToolchains ?? []}>
+                        {(toolchain) => (
+                          <li class="event-item">
+                            <div class="event-copy text-wrap">{toolchain}</div>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+
+                  <div class="subsection-title">Rust tools</div>
+                  <div class="tool-status-grid">
+                    <For each={rustToolStatus()}>
+                      {(tool) => (
+                        <div class={`pill${tool.available ? " available" : ""}`}>
+                          <span class="pill-dot" />
+                          <span>{tool.label}</span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </article>
+
+                <article class="status-card">
+                  <div class="status-card-head">
+                    <div class="status-card-title">Cargo / rust-analyzer workflow</div>
+                    <span
+                      class={`state-badge ${
+                        activeDocument()?.language === "rust" ? "ready" : "muted"
+                      }`}
+                    >
+                      {activeDocument()?.language === "rust" ? "active" : "idle"}
+                    </span>
+                  </div>
+
+                  <div class="status-card-copy">{rustManagementSummary()}</div>
+
+                  <div class="status-row-list">
+                    <div class="status-row">
+                      <span>Editor</span>
+                      <strong>
+                        {rustEnvironment()?.cargoTomlExists &&
+                        rustEnvironment()?.rustAnalyzerAvailable
+                          ? "rust-analyzer hover and semantic tokens"
+                          : "Standalone parser hover and semantic tokens"}
+                      </strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Diagnostics</span>
+                      <strong>Cargo JSON diagnostics on explicit runs</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Debug</span>
+                      <strong>
+                        {rustEnvironment()?.lldbAvailable || rustEnvironment()?.codelldbAvailable
+                          ? "LLDB adapter detected"
+                          : "Install LLDB or CodeLLDB"}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div class="tooling-button-grid">
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("check")}
+                    >
+                      {runningRustToolingAction() === "check" ? "Checking..." : "Cargo check"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("clippy")}
+                    >
+                      {runningRustToolingAction() === "clippy" ? "Linting..." : "Clippy"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("format")}
+                    >
+                      {runningRustToolingAction() === "format" ? "Formatting..." : "rustfmt"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("test")}
+                    >
+                      {runningRustToolingAction() === "test" ? "Testing..." : "Cargo test"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("build")}
+                    >
+                      {runningRustToolingAction() === "build" ? "Building..." : "Cargo build"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("doc")}
+                    >
+                      {runningRustToolingAction() === "doc" ? "Documenting..." : "Cargo doc"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isRustToolingAvailable() || Boolean(runningRustToolingAction())}
+                      onClick={() => void runRustTooling("metadata")}
+                    >
+                      {runningRustToolingAction() === "metadata"
+                        ? "Reading..."
+                        : "Cargo metadata"}
+                    </button>
                   </div>
                 </article>
 
@@ -3744,7 +4720,7 @@ export default function App() {
 
                 <article class="status-card">
                   <div class="status-card-head">
-                    <div class="status-card-title">Missing package workflow</div>
+                    <div class="status-card-title">Ruff / ty package workflow</div>
                     <span
                       class={`state-badge ${
                         missingImports().length ? "warning" : "muted"
@@ -3761,11 +4737,11 @@ export default function App() {
                   <div class="status-row-list">
                     <div class="status-row">
                       <span>Scan trigger</span>
-                      <strong>Active `.py` file after typing settles</strong>
+                      <strong>Ruff and ty after active `.py` typing settles</strong>
                     </div>
                     <div class="status-row">
                       <span>Review step</span>
-                      <strong>Hematite collects unresolved imports below</strong>
+                      <strong>ty unresolved imports become install candidates</strong>
                     </div>
                     <div class="status-row">
                       <span>Install step</span>
@@ -3779,6 +4755,51 @@ export default function App() {
                           : "No `.venv` to auto-activate yet"}
                       </strong>
                     </div>
+                  </div>
+
+                  <div class="tooling-button-grid">
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isPythonToolingAvailable() || Boolean(runningPythonToolingAction())}
+                      onClick={() => void runPythonTooling("check")}
+                    >
+                      {runningPythonToolingAction() === "check" ? "Checking..." : "Ruff check"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isPythonToolingAvailable() || Boolean(runningPythonToolingAction())}
+                      onClick={() => void runPythonTooling("format")}
+                    >
+                      {runningPythonToolingAction() === "format" ? "Formatting..." : "Format"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isPythonToolingAvailable() || Boolean(runningPythonToolingAction())}
+                      onClick={() => void runPythonTooling("fixAll")}
+                    >
+                      {runningPythonToolingAction() === "fixAll" ? "Fixing..." : "Fix all"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isPythonToolingAvailable() || Boolean(runningPythonToolingAction())}
+                      onClick={() => void runPythonTooling("organizeImports")}
+                    >
+                      {runningPythonToolingAction() === "organizeImports"
+                        ? "Organizing..."
+                        : "Organize imports"}
+                    </button>
+                    <button
+                      type="button"
+                      class="pane-button"
+                      disabled={!isPythonToolingAvailable() || Boolean(runningPythonToolingAction())}
+                      onClick={() => void runPythonTooling("typeCheck")}
+                    >
+                      {runningPythonToolingAction() === "typeCheck" ? "Checking..." : "ty check"}
+                    </button>
                   </div>
                 </article>
 
@@ -3813,6 +4834,28 @@ export default function App() {
                     {prepareOutcome()?.command}
                     {"\n\n"}
                     {prepareOutcome()?.stdout || prepareOutcome()?.stderr || "No output"}
+                  </pre>
+                </Show>
+
+                <Show when={pythonToolingOutcome()}>
+                  <div class="terminal-label">Python tooling activity</div>
+                  <pre class="terminal-output compact">
+                    {pythonToolingOutcome()?.command}
+                    {"\n\n"}
+                    {pythonToolingOutcome()?.stdout ||
+                      pythonToolingOutcome()?.stderr ||
+                      "No output"}
+                  </pre>
+                </Show>
+
+                <Show when={rustToolingOutcome()}>
+                  <div class="terminal-label">Rust tooling activity</div>
+                  <pre class="terminal-output compact">
+                    {rustToolingOutcome()?.command}
+                    {"\n\n"}
+                    {rustToolingOutcome()?.stdout ||
+                      rustToolingOutcome()?.stderr ||
+                      `${rustToolingOutcome()?.diagnostics?.length ?? 0} diagnostic(s)`}
                   </pre>
                 </Show>
 
@@ -3872,13 +4915,90 @@ export default function App() {
               </section>
             </Show>
 
+            <Show when={utilityTab() === "problems"}>
+              <section class="panel-section no-divider">
+                <div class="pane-header compact">
+                  <div>
+                    <div class="pane-title">Problems</div>
+                    <div class="pane-caption">
+                      Active-file diagnostics from Ruff, ty, Cargo, and language services
+                    </div>
+                  </div>
+                </div>
+
+                <Show
+                  when={activeDocument()}
+                  fallback={<div class="empty-note">Open a source file to inspect diagnostics.</div>}
+                >
+                  <div class="problem-summary-grid">
+                    <div class="problem-summary-item">
+                      <span>Errors</span>
+                      <strong>{activeDiagnosticStats().errors}</strong>
+                    </div>
+                    <div class="problem-summary-item">
+                      <span>Warnings</span>
+                      <strong>{activeDiagnosticStats().warnings}</strong>
+                    </div>
+                    <div class="problem-summary-item">
+                      <span>Total</span>
+                      <strong>{activeDiagnosticStats().total}</strong>
+                    </div>
+                  </div>
+
+                  <Show when={activeDiagnosticSources().length}>
+                    <div class="diagnostic-source-row">
+                      <For each={activeDiagnosticSources()}>
+                        {(source) => (
+                          <span class="source-chip">
+                            {source.label} {source.count}
+                          </span>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+
+                  <Show
+                    when={activeDiagnosticsSorted().length}
+                    fallback={<div class="empty-note">No active diagnostics for the current file.</div>}
+                  >
+                    <ul class="symbol-list">
+                      <For each={activeDiagnosticsSorted()}>
+                        {(diagnostic) => (
+                          <li>
+                            <button
+                              type="button"
+                              class="symbol-item problem-item"
+                              onClick={() => resetLineJump(setJumpToLine, diagnostic.line)}
+                            >
+                              <span class={`symbol-kind ${diagnostic.severity}`}>
+                                {diagnostic.severity}
+                              </span>
+                              <span class="problem-copy">
+                                <span class="symbol-name">{diagnostic.message}</span>
+                                <span class="problem-source">
+                                  {diagnosticSourceLabel(diagnostic.module)}
+                                </span>
+                              </span>
+                              <span class="symbol-line">
+                                L{diagnostic.line}:C{diagnostic.column}
+                              </span>
+                            </button>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+                </Show>
+              </section>
+            </Show>
+
             <Show when={utilityTab() === "outline"}>
               <section class="panel-section no-divider">
                 <div class="pane-header compact">
                   <div>
                     <div class="pane-title">Structure</div>
                     <div class="pane-caption">
-                      tree-sitter outline, diagnostics, and compact context
+                      tree-sitter outline and compact context
                     </div>
                   </div>
                 </div>
@@ -3900,32 +5020,6 @@ export default function App() {
                             <span class="symbol-kind">{symbol.kind}</span>
                             <span class="symbol-name">{symbol.label}</span>
                             <span class="symbol-line">L{symbol.startLine}</span>
-                          </button>
-                        </li>
-                      )}
-                    </For>
-                  </ul>
-                </Show>
-
-                <div class="subsection-title">Diagnostics</div>
-                <Show
-                  when={activeDocument()?.diagnostics?.length}
-                  fallback={<div class="empty-note">No active diagnostics for the current file.</div>}
-                >
-                  <ul class="symbol-list">
-                    <For each={activeDocument()?.diagnostics ?? []}>
-                      {(diagnostic) => (
-                        <li>
-                          <button
-                            type="button"
-                            class="symbol-item"
-                            onClick={() => resetLineJump(setJumpToLine, diagnostic.line)}
-                          >
-                            <span class={`symbol-kind ${diagnostic.severity}`}>
-                              {diagnostic.severity}
-                            </span>
-                            <span class="symbol-name">{diagnostic.message}</span>
-                            <span class="symbol-line">L{diagnostic.line}</span>
                           </button>
                         </li>
                       )}
@@ -4049,6 +5143,27 @@ export default function App() {
           </div>
         </section>
       </Show>
+
+      <footer class="status-bar">
+        <div class="status-bar-left">
+          <span>{statusMessage()}</span>
+          <span>{workspaceRoot() ? basename(workspaceRoot()!) : "No workspace"}</span>
+        </div>
+        <div class="status-bar-right">
+          <Show when={activeDocument()} fallback={<span>No file</span>}>
+            <span>{activeDocument()?.language}</span>
+            <span>{activeDocument()?.dirty ? "Unsaved" : "Saved"}</span>
+            <span>
+              Ln {cursorPosition().line}, Col {cursorPosition().column}
+            </span>
+            <span>
+              {activeDiagnosticStats().errors}E {activeDiagnosticStats().warnings}W
+            </span>
+            <span>{lineWrapping() ? "Wrap" : "No wrap"}</span>
+            <span>{activeTab() ? basename(activeTab()!) : "No file"}</span>
+          </Show>
+        </div>
+      </footer>
     </main>
   );
 }

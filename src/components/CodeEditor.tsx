@@ -5,12 +5,10 @@ import {
   type Extension,
   type Text,
 } from "@codemirror/state";
-import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { lintGutter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
 import { Decoration, EditorView, hoverTooltip, keymap } from "@codemirror/view";
 import { indentWithTab } from "@codemirror/commands";
 import { basicSetup } from "codemirror";
-import { tags } from "@lezer/highlight";
 import { createEffect, onCleanup, onMount } from "solid-js";
 
 type EditorSemanticToken = {
@@ -32,57 +30,30 @@ type EditorHoverItem = {
   endColumn: number;
 };
 
+type EditorHoverRequest = {
+  path: string;
+  content: string;
+  line: number;
+  column: number;
+};
+
 type CodeEditorProps = {
   value: string;
   path: string;
   diagnostics: Diagnostic[];
   semanticTokens: EditorSemanticToken[];
-  hoverItems: EditorHoverItem[];
+  lineWrapping: boolean;
+  onHover?: (request: EditorHoverRequest) => Promise<EditorHoverItem | null>;
   jumpToLine: number | null;
   onChange: (value: string) => void;
+  onCursorChange?: (line: number, column: number) => void;
   onSave: () => void;
 };
 
 const languageCompartment = new Compartment();
 const semanticCompartment = new Compartment();
 const hoverCompartment = new Compartment();
-
-const editorHighlightStyle = HighlightStyle.define([
-  {
-    tag: [
-      tags.keyword,
-      tags.modifier,
-      tags.controlKeyword,
-      tags.definitionKeyword,
-      tags.moduleKeyword,
-      tags.operatorKeyword,
-      tags.controlOperator,
-    ],
-    color: "#ff9e64",
-  },
-  { tag: [tags.atom, tags.bool, tags.null], color: "#ffb870" },
-  { tag: [tags.number, tags.integer, tags.float], color: "#ffd479" },
-  { tag: [tags.string, tags.special(tags.string)], color: "#9fe870" },
-  { tag: [tags.regexp, tags.escape], color: "#73e2d1" },
-  {
-    tag: [tags.comment, tags.lineComment, tags.blockComment],
-    color: "#90a4c0",
-    fontStyle: "italic",
-  },
-  { tag: [tags.variableName, tags.self], color: "#edf3ff" },
-  { tag: [tags.definition(tags.variableName), tags.labelName], color: "#ffca8f" },
-  { tag: [tags.namespace], color: "#57dcc4" },
-  { tag: [tags.typeName, tags.className], color: "#8cb8ff" },
-  { tag: [tags.propertyName, tags.attributeName], color: "#86dfff" },
-  { tag: [tags.function(tags.variableName), tags.function(tags.propertyName)], color: "#ffd166" },
-  { tag: [tags.definition(tags.function(tags.variableName))], color: "#7fe3ff" },
-  { tag: [tags.operator, tags.punctuation, tags.separator], color: "#d6deea" },
-  { tag: [tags.meta, tags.annotation], color: "#ffc08f" },
-  { tag: [tags.heading], color: "#8fddff", fontWeight: "700" },
-  { tag: [tags.emphasis], fontStyle: "italic" },
-  { tag: [tags.strong], fontWeight: "700" },
-  { tag: [tags.link], color: "#8fddff", textDecoration: "underline" },
-]);
+const lineWrappingCompartment = new Compartment();
 
 const editorTheme = EditorView.theme(
   {
@@ -96,7 +67,7 @@ const editorTheme = EditorView.theme(
       "-webkit-font-smoothing": "antialiased",
     },
     ".cm-scroller": {
-      "line-height": "1.72",
+      "line-height": "1.55",
       overflow: "auto",
       "overscroll-behavior": "contain",
     },
@@ -149,6 +120,9 @@ const editorTheme = EditorView.theme(
       border: "1px solid rgba(255,255,255,0.11)",
       color: "#eef4fb",
       "box-shadow": "0 10px 30px rgba(0, 0, 0, 0.34)",
+      "max-width": "min(720px, 72vw)",
+      "max-height": "min(440px, 56vh)",
+      overflow: "hidden",
     },
     ".cm-panels": {
       "background-color": "#10151d",
@@ -179,20 +153,52 @@ const editorTheme = EditorView.theme(
     ".cm-diagnosticText": {
       "font-family": '"IBM Plex Sans", "Segoe UI", sans-serif',
     },
-    ".cm-content .cm-semantic-namespace, .cm-content .cm-semantic-namespace *": {
+    ".cm-content .cm-semantic-keyword, .cm-content .cm-semantic-keyword *, .cm-content .cm-semantic-modifier, .cm-content .cm-semantic-modifier *": {
+      color: "#ff7ab2 !important",
+    },
+    ".cm-content .cm-semantic-string, .cm-content .cm-semantic-string *": {
+      color: "#a6e3a1 !important",
+    },
+    ".cm-content .cm-semantic-number, .cm-content .cm-semantic-number *": {
+      color: "#ffd479 !important",
+    },
+    ".cm-content .cm-semantic-operator, .cm-content .cm-semantic-operator *": {
+      color: "#d7e1ef !important",
+    },
+    ".cm-content .cm-semantic-comment, .cm-content .cm-semantic-comment *": {
+      color: "#8ea4c1 !important",
+      "font-style": "italic",
+    },
+    ".cm-content .cm-semantic-namespace, .cm-content .cm-semantic-module, .cm-content .cm-semantic-namespace *, .cm-content .cm-semantic-module *": {
       color: "#57dcc4 !important",
     },
-    ".cm-content .cm-semantic-functionDefinition, .cm-content .cm-semantic-functionDefinition *, .cm-content .cm-semantic-methodDefinition, .cm-content .cm-semantic-methodDefinition *":
+    ".cm-content .cm-semantic-function, .cm-content .cm-semantic-function *, .cm-content .cm-semantic-functionDefinition, .cm-content .cm-semantic-functionDefinition *, .cm-content .cm-semantic-methodDefinition, .cm-content .cm-semantic-methodDefinition *":
       {
         color: "#86e1fc !important",
       },
-    ".cm-content .cm-semantic-functionCall, .cm-content .cm-semantic-functionCall *, .cm-content .cm-semantic-methodCall, .cm-content .cm-semantic-methodCall *":
+    ".cm-content .cm-semantic-method, .cm-content .cm-semantic-method *, .cm-content .cm-semantic-functionCall, .cm-content .cm-semantic-functionCall *, .cm-content .cm-semantic-methodCall, .cm-content .cm-semantic-methodCall *":
       {
         color: "#ffd479 !important",
       },
-    ".cm-content .cm-semantic-classDefinition, .cm-content .cm-semantic-classDefinition *, .cm-content .cm-semantic-classReference, .cm-content .cm-semantic-classReference *":
+    ".cm-content .cm-semantic-macro, .cm-content .cm-semantic-macro *, .cm-content .cm-semantic-attribute, .cm-content .cm-semantic-attribute *":
+      {
+        color: "#c792ea !important",
+      },
+    ".cm-content .cm-semantic-class, .cm-content .cm-semantic-class *, .cm-content .cm-semantic-type, .cm-content .cm-semantic-type *, .cm-content .cm-semantic-classDefinition, .cm-content .cm-semantic-classDefinition *, .cm-content .cm-semantic-classReference, .cm-content .cm-semantic-classReference *":
       {
         color: "#8cb8ff !important",
+      },
+    ".cm-content .cm-semantic-struct, .cm-content .cm-semantic-struct *, .cm-content .cm-semantic-enum, .cm-content .cm-semantic-enum *, .cm-content .cm-semantic-enumMember, .cm-content .cm-semantic-enumMember *, .cm-content .cm-semantic-builtinType, .cm-content .cm-semantic-builtinType *":
+      {
+        color: "#8cb8ff !important",
+      },
+    ".cm-content .cm-semantic-lifetime, .cm-content .cm-semantic-lifetime *": {
+      color: "#ffbe7a !important",
+    },
+    ".cm-content .cm-semantic-unresolvedReference, .cm-content .cm-semantic-unresolvedReference *":
+      {
+        color: "#ff6b8a !important",
+        "text-decoration": "underline wavy rgba(255, 107, 138, 0.72)",
       },
     ".cm-content .cm-semantic-parameter, .cm-content .cm-semantic-parameter *": {
       color: "#ffbe7a !important",
@@ -201,7 +207,7 @@ const editorTheme = EditorView.theme(
       {
         color: "#ffd29c !important",
       },
-    ".cm-content .cm-semantic-variable, .cm-content .cm-semantic-variable *": {
+    ".cm-content .cm-semantic-variable, .cm-content .cm-semantic-variable *, .cm-content .cm-semantic-identifier, .cm-content .cm-semantic-identifier *": {
       color: "#eef5ff !important",
     },
     ".cm-content .cm-semantic-property, .cm-content .cm-semantic-property *": {
@@ -210,8 +216,10 @@ const editorTheme = EditorView.theme(
     ".hematite-hover": {
       display: "grid",
       gap: "8px",
-      "max-width": "420px",
-      padding: "2px",
+      "max-width": "min(700px, 70vw)",
+      "max-height": "min(420px, 54vh)",
+      padding: "4px",
+      overflow: "auto",
     },
     ".hematite-hover-head": {
       display: "flex",
@@ -224,7 +232,8 @@ const editorTheme = EditorView.theme(
       "font-family": '"JetBrains Mono", "IBM Plex Mono", Consolas, monospace',
       "font-size": "12px",
       "font-weight": "600",
-      "line-height": "1.5",
+      "line-height": "1.45",
+      "white-space": "pre-wrap",
       "overflow-wrap": "anywhere",
     },
     ".hematite-hover-kind": {
@@ -238,7 +247,7 @@ const editorTheme = EditorView.theme(
       color: "#c8d7ea",
       "font-family": '"IBM Plex Sans", "Segoe UI", sans-serif',
       "font-size": "12px",
-      "line-height": "1.55",
+      "line-height": "1.5",
       "white-space": "pre-wrap",
       "overflow-wrap": "anywhere",
     },
@@ -260,63 +269,26 @@ function positionFromLineColumn(doc: Text, lineNumber: number, columnNumber: num
   return Math.min(line.from + safeColumn - 1, line.to);
 }
 
-function hoverSummary(item: EditorHoverItem) {
-  return [item.kind, item.title, item.detail, item.source].filter(Boolean).join("\n");
-}
-
-function semanticDecorations(
-  tokens: EditorSemanticToken[],
-  hoverItems: EditorHoverItem[]
-): Extension {
-  if (!tokens.length && !hoverItems.length) {
+function semanticDecorations(tokens: EditorSemanticToken[]): Extension {
+  if (!tokens.length) {
     return [];
   }
 
   return StateField.define({
     create(state) {
-      const ranges = [
-        ...tokens.map((token) => {
+      const ranges = tokens
+        .map((token) => {
           const from = positionFromLineColumn(state.doc, token.startLine, token.startColumn);
           const to = Math.max(
             from + 1,
             positionFromLineColumn(state.doc, token.endLine, token.endColumn)
           );
-          const hover = hoverItems.find(
-            (item) =>
-              item.startLine === token.startLine &&
-              item.startColumn === token.startColumn &&
-              item.endLine === token.endLine &&
-              item.endColumn === token.endColumn
-          );
 
           return Decoration.mark({
             class: `cm-semantic-${token.kind}`,
-            attributes: hover ? { title: hoverSummary(hover) } : {},
           }).range(from, to);
-        }),
-        ...hoverItems
-          .filter(
-            (item) =>
-              !tokens.some(
-                (token) =>
-                  token.startLine === item.startLine &&
-                  token.startColumn === item.startColumn &&
-                  token.endLine === item.endLine &&
-                  token.endColumn === item.endColumn
-              )
-          )
-          .map((item) => {
-            const from = positionFromLineColumn(state.doc, item.startLine, item.startColumn);
-            const to = Math.max(
-              from + 1,
-              positionFromLineColumn(state.doc, item.endLine, item.endColumn)
-            );
-            return Decoration.mark({
-              class: "cm-semantic-hoverTarget",
-              attributes: { title: hoverSummary(item) },
-            }).range(from, to);
-          }),
-      ].sort((left, right) => left.from - right.from || left.to - right.to);
+        })
+        .sort((left, right) => left.from - right.from || left.to - right.to);
 
       return Decoration.set(ranges, true);
     },
@@ -331,31 +303,32 @@ function semanticDecorations(
   });
 }
 
-function hoverTooltips(items: EditorHoverItem[]): Extension {
-  if (!items.length) {
+function hoverTooltips(
+  path: string,
+  content: string,
+  onHover: CodeEditorProps["onHover"]
+): Extension {
+  if (!onHover) {
     return [];
   }
 
   return hoverTooltip(
-    (view, pos) => {
-      const match = items.find((item) => {
-        const from = positionFromLineColumn(view.state.doc, item.startLine, item.startColumn);
-        const to = Math.max(
-          from + 1,
-          positionFromLineColumn(view.state.doc, item.endLine, item.endColumn)
-        );
-        return pos >= from && pos <= to;
+    async (view, pos) => {
+      const line = view.state.doc.lineAt(pos);
+      const match = await onHover({
+        path,
+        content,
+        line: line.number,
+        column: pos - line.from + 1,
       });
 
-      if (!match) {
+      if (!match?.title && !match?.detail) {
         return null;
       }
 
-      const from = positionFromLineColumn(view.state.doc, match.startLine, match.startColumn);
-      const to = Math.max(
-        from + 1,
-        positionFromLineColumn(view.state.doc, match.endLine, match.endColumn)
-      );
+      const word = view.state.wordAt(pos);
+      const from = word?.from ?? pos;
+      const to = word?.to ?? pos + 1;
 
       return {
         pos: from,
@@ -370,12 +343,12 @@ function hoverTooltips(items: EditorHoverItem[]): Extension {
 
           const kind = document.createElement("span");
           kind.className = "hematite-hover-kind";
-          kind.textContent = match.kind;
+          kind.textContent = match.kind || "Language";
           head.append(kind);
 
           const title = document.createElement("div");
           title.className = "hematite-hover-title";
-          title.textContent = match.title;
+          title.textContent = match.title || "Symbol";
           head.append(title);
           dom.append(head);
 
@@ -397,8 +370,18 @@ function hoverTooltips(items: EditorHoverItem[]): Extension {
         },
       };
     },
-    { hoverTime: 260 }
+    { hoverTime: 320, hideOnChange: true }
   );
+}
+
+function emitCursorPosition(view: EditorView, onCursorChange?: CodeEditorProps["onCursorChange"]) {
+  if (!onCursorChange) {
+    return;
+  }
+
+  const head = view.state.selection.main.head;
+  const line = view.state.doc.lineAt(head);
+  onCursorChange(line.number, head - line.from + 1);
 }
 
 async function languageExtensionForPath(path: string): Promise<Extension> {
@@ -412,6 +395,19 @@ async function languageExtensionForPath(path: string): Promise<Extension> {
     case "rs": {
       const { rust } = await import("@codemirror/lang-rust");
       return rust();
+    }
+    case "c":
+    case "h":
+    case "cc":
+    case "cpp":
+    case "cxx":
+    case "hh":
+    case "hpp":
+    case "hxx":
+    case "cu":
+    case "cuh": {
+      const { cpp } = await import("@codemirror/lang-cpp");
+      return cpp();
     }
     case "ts": {
       const { javascript } = await import("@codemirror/lang-javascript");
@@ -465,7 +461,6 @@ export default function CodeEditor(props: CodeEditorProps) {
         extensions: [
           basicSetup,
           editorTheme,
-          syntaxHighlighting(editorHighlightStyle),
           lintGutter(),
           keymap.of([
             indentWithTab,
@@ -481,9 +476,13 @@ export default function CodeEditor(props: CodeEditorProps) {
           languageCompartment.of([]),
           semanticCompartment.of([]),
           hoverCompartment.of([]),
+          lineWrappingCompartment.of(props.lineWrapping ? EditorView.lineWrapping : []),
           EditorView.updateListener.of((update) => {
             if (update.docChanged) {
               props.onChange(update.state.doc.toString());
+            }
+            if (update.docChanged || update.selectionSet) {
+              emitCursorPosition(update.view, props.onCursorChange);
             }
           }),
         ],
@@ -492,6 +491,7 @@ export default function CodeEditor(props: CodeEditorProps) {
     });
 
     view.dispatch(setDiagnostics(view.state, props.diagnostics));
+    emitCursorPosition(view, props.onCursorChange);
   });
 
   createEffect(() => {
@@ -535,26 +535,36 @@ export default function CodeEditor(props: CodeEditorProps) {
 
   createEffect(() => {
     props.semanticTokens;
-    props.hoverItems;
     if (!view) {
       return;
     }
 
     view.dispatch({
-      effects: semanticCompartment.reconfigure(
-        semanticDecorations(props.semanticTokens, props.hoverItems)
-      ),
+      effects: semanticCompartment.reconfigure(semanticDecorations(props.semanticTokens)),
     });
   });
 
   createEffect(() => {
-    props.hoverItems;
+    const path = props.path;
+    const content = props.value;
+    const onHover = props.onHover;
     if (!view) {
       return;
     }
 
     view.dispatch({
-      effects: hoverCompartment.reconfigure(hoverTooltips(props.hoverItems)),
+      effects: hoverCompartment.reconfigure(hoverTooltips(path, content, onHover)),
+    });
+  });
+
+  createEffect(() => {
+    const enabled = props.lineWrapping;
+    if (!view) {
+      return;
+    }
+
+    view.dispatch({
+      effects: lineWrappingCompartment.reconfigure(enabled ? EditorView.lineWrapping : []),
     });
   });
 
