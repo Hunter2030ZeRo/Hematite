@@ -9,9 +9,12 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Output, Stdio},
-    sync::{mpsc, Arc, Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc, Arc, Mutex, OnceLock,
+    },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
     menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu},
@@ -32,6 +35,11 @@ const PYTHON_INSTALL_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 const UI_STATE_FILE_NAME: &str = "ui-state.json";
 const LEGACY_UI_STATE_IDENTIFIERS: &[&str] = &["com.entity_27th.hematite"];
 const CODEX_SAFE_MODEL_FOR_OLD_GPT55_CONFIG: &str = "gpt-5.2";
+const MAX_AGENT_SESSIONS: usize = 12;
+const MAX_AGENT_SESSION_MESSAGES: usize = 80;
+const MAX_AGENT_MESSAGE_CHARS: usize = 120_000;
+const MAX_AGENT_ATTACHMENT_CHARS: usize = 120_000;
+const MAX_AGENT_RUN_OUTPUT_CHARS: usize = 200_000;
 #[cfg(target_os = "windows")]
 const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
 #[cfg(target_os = "windows")]
@@ -44,6 +52,7 @@ static CODEX_MODEL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 static GEMINI_ACP: OnceLock<Mutex<GeminiAcpState>> = OnceLock::new();
 static TY_LSP: OnceLock<Mutex<TyLspState>> = OnceLock::new();
 static RUST_ANALYZER_LSP: OnceLock<Mutex<RustAnalyzerLspState>> = OnceLock::new();
+static AGENT_SESSIONS: OnceLock<AgentSessionRegistry> = OnceLock::new();
 
 const PYTHON_MISSING_IMPORT_PREFIX: &str = "import:";
 const LSP_SEMANTIC_TOKEN_TYPES: &[&str] = &[
@@ -197,6 +206,60 @@ enum SourceLanguage {
     JavaScript,
     TypeScript,
     Tsx,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+enum LanguageProviderAvailability {
+    Active,
+    Degraded,
+    Missing,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+#[allow(dead_code)]
+enum LanguageFeature {
+    Diagnostics,
+    Hover,
+    Outline,
+    WorkspaceSymbols,
+    DocumentSymbols,
+    SemanticTokens,
+    Formatting,
+    OrganizeImports,
+    CodeActions,
+    References,
+    Rename,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LanguageCapabilityStatus {
+    language_id: String,
+    provider_name: String,
+    availability: LanguageProviderAvailability,
+    resolved_path: Option<String>,
+    supported_features: Vec<LanguageFeature>,
+    inactive_reason: Option<String>,
+    recommended_action: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolPathSnapshot {
+    ruff: Option<PathBuf>,
+    ty: Option<PathBuf>,
+    rust_analyzer: Option<PathBuf>,
+    clangd: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ProjectMetadataSnapshot {
+    has_pyproject: bool,
+    has_cargo_toml: bool,
+    has_compile_commands: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -355,6 +418,393 @@ struct AgentRunResponse {
     stdout: String,
     stderr: String,
     context: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AgentSessionRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AgentSessionRunState {
+    Idle,
+    Running,
+    AwaitingApproval,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentContextAttachment {
+    kind: String,
+    label: String,
+    content: String,
+    estimated_chars: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSessionMessage {
+    id: String,
+    role: AgentSessionRole,
+    content: String,
+    attachments: Vec<AgentContextAttachment>,
+    created_at_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentSession {
+    id: String,
+    provider_id: String,
+    model_id: Option<String>,
+    permission_level: String,
+    workspace_root: Option<String>,
+    state: AgentSessionRunState,
+    active_turn_id: Option<String>,
+    messages: Vec<AgentSessionMessage>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAgentSessionRequest {
+    provider_id: String,
+    model_id: Option<String>,
+    permission_level: String,
+    workspace_root: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SendAgentSessionMessageRequest {
+    session_id: String,
+    content: String,
+    attachments: Vec<AgentContextAttachment>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CancelAgentSessionTurnRequest {
+    session_id: String,
+}
+
+#[derive(Default)]
+struct AgentSessionRegistry {
+    sessions: Mutex<BTreeMap<String, AgentSession>>,
+    next_session_id: AtomicUsize,
+}
+
+fn language_id(language: SourceLanguage) -> &'static str {
+    match language {
+        SourceLanguage::Python => "python",
+        SourceLanguage::Rust => "rust",
+        SourceLanguage::C => "c",
+        SourceLanguage::Cpp => "cpp",
+        SourceLanguage::Cuda => "cuda-cpp",
+        SourceLanguage::JavaScript => "javascript",
+        SourceLanguage::TypeScript => "typescript",
+        SourceLanguage::Tsx => "typescriptreact",
+    }
+}
+
+fn features_for_language_provider(
+    language: SourceLanguage,
+    provider_name: &str,
+    project_ready: bool,
+) -> Vec<LanguageFeature> {
+    match (language, provider_name, project_ready) {
+        (SourceLanguage::Python, "ruff", true) => vec![
+            LanguageFeature::Diagnostics,
+            LanguageFeature::Formatting,
+            LanguageFeature::OrganizeImports,
+            LanguageFeature::CodeActions,
+        ],
+        (SourceLanguage::Python, "ty", true) => vec![
+            LanguageFeature::Diagnostics,
+            LanguageFeature::Hover,
+            LanguageFeature::SemanticTokens,
+        ],
+        (SourceLanguage::Rust, "rust-analyzer", true) => vec![
+            LanguageFeature::Diagnostics,
+            LanguageFeature::Hover,
+            LanguageFeature::Outline,
+            LanguageFeature::DocumentSymbols,
+            LanguageFeature::SemanticTokens,
+            LanguageFeature::Formatting,
+            LanguageFeature::References,
+            LanguageFeature::Rename,
+        ],
+        (SourceLanguage::C | SourceLanguage::Cpp | SourceLanguage::Cuda, "clangd", true) => vec![
+            LanguageFeature::Diagnostics,
+            LanguageFeature::Hover,
+            LanguageFeature::Outline,
+            LanguageFeature::DocumentSymbols,
+            LanguageFeature::SemanticTokens,
+            LanguageFeature::References,
+            LanguageFeature::Rename,
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn missing_tool_action(provider_name: &str) -> String {
+    format!(
+        "Install {provider_name} or open Hematite from an environment where {provider_name} is on PATH."
+    )
+}
+
+fn language_capability_status_for_tool(
+    language: SourceLanguage,
+    provider_name: &str,
+    resolved_path: Option<PathBuf>,
+    project_ready: bool,
+) -> LanguageCapabilityStatus {
+    let resolved_path_string = resolved_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let supported_features =
+        features_for_language_provider(language, provider_name, project_ready && resolved_path.is_some());
+
+    let availability = if resolved_path.is_none() {
+        LanguageProviderAvailability::Missing
+    } else if !project_ready {
+        LanguageProviderAvailability::Degraded
+    } else {
+        LanguageProviderAvailability::Active
+    };
+
+    let inactive_reason = match availability {
+        LanguageProviderAvailability::Missing => {
+            Some(format!("{provider_name} is not installed on PATH."))
+        }
+        LanguageProviderAvailability::Degraded => {
+            Some("Project metadata is incomplete for this provider.".to_string())
+        }
+        LanguageProviderAvailability::Active | LanguageProviderAvailability::Unsupported => None,
+    };
+
+    let recommended_action = match availability {
+        LanguageProviderAvailability::Missing => Some(missing_tool_action(provider_name)),
+        LanguageProviderAvailability::Degraded => {
+            Some("Open a configured project or add the metadata this language server expects.".to_string())
+        }
+        LanguageProviderAvailability::Active | LanguageProviderAvailability::Unsupported => None,
+    };
+
+    LanguageCapabilityStatus {
+        language_id: language_id(language).to_string(),
+        provider_name: provider_name.to_string(),
+        availability,
+        resolved_path: resolved_path_string,
+        supported_features,
+        inactive_reason,
+        recommended_action,
+    }
+}
+
+fn build_language_capabilities_for_paths(
+    tools: ToolPathSnapshot,
+    metadata: ProjectMetadataSnapshot,
+) -> Vec<LanguageCapabilityStatus> {
+    vec![
+        language_capability_status_for_tool(
+            SourceLanguage::Python,
+            "ruff",
+            tools.ruff,
+            metadata.has_pyproject,
+        ),
+        language_capability_status_for_tool(
+            SourceLanguage::Python,
+            "ty",
+            tools.ty,
+            metadata.has_pyproject,
+        ),
+        language_capability_status_for_tool(
+            SourceLanguage::Rust,
+            "rust-analyzer",
+            tools.rust_analyzer,
+            metadata.has_cargo_toml,
+        ),
+        language_capability_status_for_tool(
+            SourceLanguage::C,
+            "clangd",
+            tools.clangd.clone(),
+            metadata.has_compile_commands,
+        ),
+        language_capability_status_for_tool(
+            SourceLanguage::Cpp,
+            "clangd",
+            tools.clangd.clone(),
+            metadata.has_compile_commands,
+        ),
+        language_capability_status_for_tool(
+            SourceLanguage::Cuda,
+            "clangd",
+            tools.clangd,
+            metadata.has_compile_commands,
+        ),
+    ]
+}
+
+fn monotonic_message_timestamp_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+fn truncate_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_string();
+    }
+
+    let mut end = 0;
+    for (count, (index, ch)) in value.char_indices().enumerate() {
+        if count == max_chars {
+            break;
+        }
+        end = index + ch.len_utf8();
+    }
+
+    let mut truncated = value[..end].to_string();
+    truncated.push_str("\n[truncated]");
+    truncated
+}
+
+fn bounded_agent_attachments(
+    attachments: Vec<AgentContextAttachment>,
+) -> Vec<AgentContextAttachment> {
+    attachments
+        .into_iter()
+        .map(|attachment| {
+            let content = truncate_text(&attachment.content, MAX_AGENT_ATTACHMENT_CHARS);
+            AgentContextAttachment {
+                estimated_chars: content.chars().count(),
+                content,
+                ..attachment
+            }
+        })
+        .collect()
+}
+
+fn bounded_process_output(bytes: &[u8]) -> String {
+    truncate_text(
+        String::from_utf8_lossy(bytes).trim(),
+        MAX_AGENT_RUN_OUTPUT_CHARS,
+    )
+}
+
+impl AgentSession {
+    fn new(
+        id: String,
+        provider_id: String,
+        model_id: Option<String>,
+        permission_level: String,
+        workspace_root: Option<String>,
+    ) -> Self {
+        Self {
+            id,
+            provider_id,
+            model_id,
+            permission_level,
+            workspace_root,
+            state: AgentSessionRunState::Idle,
+            active_turn_id: None,
+            messages: Vec::new(),
+        }
+    }
+
+    fn append_user_message(&mut self, content: String, attachments: Vec<AgentContextAttachment>) {
+        self.messages.push(AgentSessionMessage {
+            id: format!("message-{}", self.messages.len() + 1),
+            role: AgentSessionRole::User,
+            content: truncate_text(&content, MAX_AGENT_MESSAGE_CHARS),
+            attachments: bounded_agent_attachments(attachments),
+            created_at_ms: monotonic_message_timestamp_ms(),
+        });
+        if self.messages.len() > MAX_AGENT_SESSION_MESSAGES {
+            let overflow = self.messages.len() - MAX_AGENT_SESSION_MESSAGES;
+            self.messages.drain(0..overflow);
+        }
+    }
+
+    fn mark_running(&mut self, turn_id: String) {
+        self.state = AgentSessionRunState::Running;
+        self.active_turn_id = Some(turn_id);
+    }
+
+    fn cancel_running_turn(&mut self) {
+        if self.state == AgentSessionRunState::Running {
+            self.state = AgentSessionRunState::Idle;
+            self.active_turn_id = None;
+        }
+    }
+}
+
+impl AgentSessionRegistry {
+    fn create_session(&self, request: CreateAgentSessionRequest) -> AgentSession {
+        let mut sessions = self.sessions.lock().expect("agent session lock poisoned");
+        while sessions.len() >= MAX_AGENT_SESSIONS {
+            let Some(oldest_id) = sessions.keys().next().cloned() else {
+                break;
+            };
+            sessions.remove(&oldest_id);
+        }
+        let next_id = self.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let id = format!("agent-session-{next_id}");
+        let session = AgentSession::new(
+            id.clone(),
+            request.provider_id,
+            request.model_id,
+            request.permission_level,
+            request.workspace_root,
+        );
+        sessions.insert(id, session.clone());
+        session
+    }
+
+    #[allow(dead_code)]
+    fn get_session(&self, session_id: &str) -> Option<AgentSession> {
+        self.sessions
+            .lock()
+            .expect("agent session lock poisoned")
+            .get(session_id)
+            .cloned()
+    }
+
+    fn send_message(
+        &self,
+        request: SendAgentSessionMessageRequest,
+    ) -> Result<AgentSession, String> {
+        let mut sessions = self.sessions.lock().map_err(|error| error.to_string())?;
+        let session = sessions
+            .get_mut(&request.session_id)
+            .ok_or_else(|| "Agent session was not found.".to_string())?;
+        session.append_user_message(request.content, request.attachments);
+        let next_turn = format!("{}-turn-{}", session.id, session.messages.len());
+        session.mark_running(next_turn);
+        Ok(session.clone())
+    }
+
+    fn cancel_session_turn(
+        &self,
+        request: CancelAgentSessionTurnRequest,
+    ) -> Result<AgentSession, String> {
+        let mut sessions = self.sessions.lock().map_err(|error| error.to_string())?;
+        let session = sessions
+            .get_mut(&request.session_id)
+            .ok_or_else(|| "Agent session was not found.".to_string())?;
+        session.cancel_running_turn();
+        Ok(session.clone())
+    }
+}
+
+fn agent_sessions() -> &'static AgentSessionRegistry {
+    AGENT_SESSIONS.get_or_init(AgentSessionRegistry::default)
 }
 
 #[derive(Deserialize)]
@@ -1248,6 +1698,57 @@ async fn refresh_agent_health() -> Result<AgentHealthPayload, String> {
 }
 
 #[tauri::command]
+async fn get_language_capabilities(
+    workspace: Option<String>,
+) -> Result<Vec<LanguageCapabilityStatus>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let workspace_root = workspace.map(PathBuf::from);
+        let metadata = ProjectMetadataSnapshot {
+            has_pyproject: workspace_root
+                .as_ref()
+                .is_some_and(|root| root.join("pyproject.toml").exists()),
+            has_cargo_toml: workspace_root
+                .as_ref()
+                .is_some_and(|root| root.join("Cargo.toml").exists()),
+            has_compile_commands: workspace_root
+                .as_ref()
+                .is_some_and(|root| root.join("compile_commands.json").exists()),
+        };
+
+        Ok(build_language_capabilities_for_paths(
+            ToolPathSnapshot {
+                ruff: probe_command("ruff").map(PathBuf::from),
+                ty: probe_command("ty").map(PathBuf::from),
+                rust_analyzer: probe_command("rust-analyzer").map(PathBuf::from),
+                clangd: probe_command("clangd").map(PathBuf::from),
+            },
+            metadata,
+        ))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
+fn create_agent_session(request: CreateAgentSessionRequest) -> Result<AgentSession, String> {
+    Ok(agent_sessions().create_session(request))
+}
+
+#[tauri::command]
+fn send_agent_session_message(
+    request: SendAgentSessionMessageRequest,
+) -> Result<AgentSession, String> {
+    agent_sessions().send_message(request)
+}
+
+#[tauri::command]
+fn cancel_agent_session_turn(
+    request: CancelAgentSessionTurnRequest,
+) -> Result<AgentSession, String> {
+    agent_sessions().cancel_session_turn(request)
+}
+
+#[tauri::command]
 fn save_agent_credentials(
     request: SaveAgentCredentialsRequest,
 ) -> Result<AgentHealthPayload, String> {
@@ -1624,7 +2125,13 @@ fn execute_terminal_command(
 }
 
 #[tauri::command]
-fn run_agent(request: AgentRunRequest) -> Result<AgentRunResponse, String> {
+async fn run_agent(request: AgentRunRequest) -> Result<AgentRunResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || run_agent_blocking(request))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn run_agent_blocking(request: AgentRunRequest) -> Result<AgentRunResponse, String> {
     let root = PathBuf::from(&request.root);
     let context = if request.include_compact_context {
         Some(compose_compact_context(
@@ -1699,8 +2206,8 @@ fn run_agent(request: AgentRunRequest) -> Result<AgentRunResponse, String> {
         success: output.status.success(),
         command: prepared.preview,
         prompt,
-        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stdout: bounded_process_output(&output.stdout),
+        stderr: bounded_process_output(&output.stderr),
         context,
     })
 }
@@ -1862,23 +2369,28 @@ fn start_gemini_turn(
     };
 
     let root_string = path_to_string(&root);
-    let state = gemini_acp_state();
-    let mut bridge = state
-        .lock()
-        .map_err(|_| "Gemini bridge lock was poisoned.".to_string())?;
     let selected_model = normalized_agent_model(request.model.as_deref());
-    let session =
-        ensure_gemini_acp_session(&mut bridge, &app, &root_string, selected_model.as_deref())?;
+    let (session_id, stdin, shared) = {
+        let state = gemini_acp_state();
+        let mut bridge = state
+            .lock()
+            .map_err(|_| "Gemini bridge lock was poisoned.".to_string())?;
+        let session =
+            ensure_gemini_acp_session(&mut bridge, &app, &root_string, selected_model.as_deref())?;
 
-    ensure_gemini_initialized(session)?;
-    let session_id = ensure_gemini_chat_session(session, &root_string)?;
+        ensure_gemini_initialized(session)?;
+        let session_id = ensure_gemini_chat_session(session, &root_string)?;
+        let stdin = Arc::clone(&session.stdin);
+        let shared = Arc::clone(&session.shared);
+        if let Ok(mut shared_state) = shared.lock() {
+            shared_state.prompt_in_progress = true;
+        }
+        (session_id, stdin, shared)
+    };
 
-    if let Ok(mut shared) = session.shared.lock() {
-        shared.prompt_in_progress = true;
-    }
-
-    let response = gemini_send_request(
-        session,
+    let response = gemini_send_request_with_handles(
+        &stdin,
+        &shared,
         "session/prompt",
         json!({
             "sessionId": session_id,
@@ -1892,8 +2404,8 @@ fn start_gemini_turn(
         Duration::from_secs(60 * 20),
     );
 
-    if let Ok(mut shared) = session.shared.lock() {
-        shared.prompt_in_progress = false;
+    if let Ok(mut shared_state) = shared.lock() {
+        shared_state.prompt_in_progress = false;
     }
 
     let response = response?;
@@ -7539,10 +8051,19 @@ fn gemini_send_request(
     params: Value,
     timeout: Duration,
 ) -> Result<Value, String> {
+    gemini_send_request_with_handles(&session.stdin, &session.shared, method, params, timeout)
+}
+
+fn gemini_send_request_with_handles(
+    stdin: &Arc<Mutex<ChildStdin>>,
+    shared: &Arc<Mutex<GeminiSharedState>>,
+    method: &str,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
     let (tx, rx) = mpsc::channel();
     let (request_id, message) = {
-        let mut shared = session
-            .shared
+        let mut shared = shared
             .lock()
             .map_err(|_| "Gemini shared state lock was poisoned.".to_string())?;
         let request_id = shared.next_request_id;
@@ -7558,8 +8079,8 @@ fn gemini_send_request(
         )
     };
 
-    if let Err(error) = send_gemini_json(&session.stdin, &message) {
-        if let Ok(mut shared) = session.shared.lock() {
+    if let Err(error) = send_gemini_json(stdin, &message) {
+        if let Ok(mut shared) = shared.lock() {
             shared.pending_responses.remove(&request_id.to_string());
         }
         return Err(error);
@@ -7569,7 +8090,7 @@ fn gemini_send_request(
         Ok(Ok(result)) => Ok(result),
         Ok(Err(error)) => Err(error),
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            if let Ok(mut shared) = session.shared.lock() {
+            if let Ok(mut shared) = shared.lock() {
                 shared.pending_responses.remove(&request_id.to_string());
             }
             Err(format!(
@@ -9975,6 +10496,10 @@ pub fn run() {
             request_editor_hover,
             build_compact_context,
             refresh_agent_health,
+            get_language_capabilities,
+            create_agent_session,
+            send_agent_session_message,
+            cancel_agent_session_turn,
             save_agent_credentials,
             launch_agent_login,
             pick_workspace_directory,
@@ -10004,6 +10529,245 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_capability_status_reports_missing_tool_without_features() {
+        let status =
+            language_capability_status_for_tool(SourceLanguage::Rust, "rust-analyzer", None, true);
+
+        assert_eq!(status.language_id, "rust");
+        assert_eq!(status.provider_name, "rust-analyzer");
+        assert_eq!(
+            status.availability,
+            LanguageProviderAvailability::Missing
+        );
+        assert!(status.supported_features.is_empty());
+        assert_eq!(
+            status.inactive_reason.as_deref(),
+            Some("rust-analyzer is not installed on PATH.")
+        );
+        assert_eq!(
+            status.recommended_action.as_deref(),
+            Some(
+                "Install rust-analyzer or open Hematite from an environment where rust-analyzer is on PATH."
+            )
+        );
+    }
+
+    #[test]
+    fn language_capability_status_reports_active_rust_features() {
+        let status = language_capability_status_for_tool(
+            SourceLanguage::Rust,
+            "rust-analyzer",
+            Some(PathBuf::from("/tools/rust-analyzer")),
+            true,
+        );
+
+        assert_eq!(status.availability, LanguageProviderAvailability::Active);
+        assert_eq!(status.resolved_path.as_deref(), Some("/tools/rust-analyzer"));
+        assert!(status
+            .supported_features
+            .contains(&LanguageFeature::Diagnostics));
+        assert!(status.supported_features.contains(&LanguageFeature::Hover));
+        assert!(status
+            .supported_features
+            .contains(&LanguageFeature::SemanticTokens));
+        assert!(status.inactive_reason.is_none());
+        assert!(status.recommended_action.is_none());
+    }
+
+    #[test]
+    fn language_capabilities_include_python_rust_and_c_family() {
+        let statuses = build_language_capabilities_for_paths(
+            ToolPathSnapshot {
+                ruff: Some(PathBuf::from("/tools/ruff")),
+                ty: Some(PathBuf::from("/tools/ty")),
+                rust_analyzer: Some(PathBuf::from("/tools/rust-analyzer")),
+                clangd: Some(PathBuf::from("/tools/clangd")),
+            },
+            ProjectMetadataSnapshot {
+                has_pyproject: true,
+                has_cargo_toml: true,
+                has_compile_commands: false,
+            },
+        );
+
+        let providers: Vec<_> = statuses
+            .iter()
+            .map(|status| {
+                (
+                    status.language_id.as_str(),
+                    status.provider_name.as_str(),
+                    status.availability,
+                )
+            })
+            .collect();
+
+        assert!(providers.contains(&(
+            "python",
+            "ruff",
+            LanguageProviderAvailability::Active
+        )));
+        assert!(providers.contains(&("python", "ty", LanguageProviderAvailability::Active)));
+        assert!(providers.contains(&(
+            "rust",
+            "rust-analyzer",
+            LanguageProviderAvailability::Active
+        )));
+        assert!(providers.contains(&("c", "clangd", LanguageProviderAvailability::Degraded)));
+        assert!(providers.contains(&(
+            "cpp",
+            "clangd",
+            LanguageProviderAvailability::Degraded
+        )));
+        assert!(providers.contains(&(
+            "cuda-cpp",
+            "clangd",
+            LanguageProviderAvailability::Degraded
+        )));
+    }
+
+    #[test]
+    fn agent_session_appends_user_message_and_enters_running_state() {
+        let mut session = AgentSession::new(
+            "session-1".to_string(),
+            "codex".to_string(),
+            Some("gpt-5.2".to_string()),
+            "ask".to_string(),
+            Some("C:/work/project".to_string()),
+        );
+
+        session.append_user_message("Review this file".to_string(), Vec::new());
+        session.mark_running("turn-1".to_string());
+
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0].role, AgentSessionRole::User);
+        assert_eq!(session.state, AgentSessionRunState::Running);
+        assert_eq!(session.active_turn_id.as_deref(), Some("turn-1"));
+    }
+
+    #[test]
+    fn agent_session_cancel_moves_running_turn_to_idle() {
+        let mut session = AgentSession::new(
+            "session-1".to_string(),
+            "codex".to_string(),
+            None,
+            "ask".to_string(),
+            None,
+        );
+
+        session.mark_running("turn-1".to_string());
+        session.cancel_running_turn();
+
+        assert_eq!(session.state, AgentSessionRunState::Idle);
+        assert!(session.active_turn_id.is_none());
+    }
+
+    #[test]
+    fn agent_session_registry_creates_and_reuses_sessions() {
+        let registry = AgentSessionRegistry::default();
+
+        let created = registry.create_session(CreateAgentSessionRequest {
+            provider_id: "codex".to_string(),
+            model_id: Some("gpt-5.2".to_string()),
+            permission_level: "ask".to_string(),
+            workspace_root: Some("C:/work/project".to_string()),
+        });
+        let fetched = registry.get_session(&created.id).expect("session should exist");
+
+        assert_eq!(created.id, fetched.id);
+        assert_eq!(fetched.provider_id, "codex");
+        assert_eq!(fetched.state, AgentSessionRunState::Idle);
+    }
+
+    #[test]
+    fn agent_session_registry_sends_message_and_cancels_turn() {
+        let registry = AgentSessionRegistry::default();
+        let session = registry.create_session(CreateAgentSessionRequest {
+            provider_id: "codex".to_string(),
+            model_id: None,
+            permission_level: "ask".to_string(),
+            workspace_root: None,
+        });
+
+        let updated = registry
+            .send_message(SendAgentSessionMessageRequest {
+                session_id: session.id.clone(),
+                content: "Explain the diagnostics".to_string(),
+                attachments: Vec::new(),
+            })
+            .expect("message should be accepted");
+
+        assert_eq!(updated.state, AgentSessionRunState::Running);
+        assert_eq!(updated.messages.len(), 1);
+
+        let cancelled = registry
+            .cancel_session_turn(CancelAgentSessionTurnRequest {
+                session_id: session.id,
+            })
+            .expect("turn should cancel");
+
+        assert_eq!(cancelled.state, AgentSessionRunState::Idle);
+    }
+
+    #[test]
+    fn agent_session_registry_bounds_session_count() {
+        let registry = AgentSessionRegistry::default();
+        let first = registry.create_session(CreateAgentSessionRequest {
+            provider_id: "codex".to_string(),
+            model_id: None,
+            permission_level: "ask".to_string(),
+            workspace_root: None,
+        });
+
+        for index in 0..MAX_AGENT_SESSIONS {
+            registry.create_session(CreateAgentSessionRequest {
+                provider_id: "codex".to_string(),
+                model_id: Some(format!("model-{index}")),
+                permission_level: "ask".to_string(),
+                workspace_root: None,
+            });
+        }
+
+        assert!(registry.get_session(&first.id).is_none());
+        assert_eq!(
+            registry
+                .sessions
+                .lock()
+                .expect("agent session lock poisoned")
+                .len(),
+            MAX_AGENT_SESSIONS
+        );
+    }
+
+    #[test]
+    fn agent_session_message_and_attachment_content_are_bounded() {
+        let mut session = AgentSession::new(
+            "session-1".to_string(),
+            "codex".to_string(),
+            None,
+            "ask".to_string(),
+            None,
+        );
+        session.append_user_message(
+            "x".repeat(MAX_AGENT_MESSAGE_CHARS + 16),
+            vec![AgentContextAttachment {
+                kind: "activeFile".to_string(),
+                label: "large.py".to_string(),
+                content: "y".repeat(MAX_AGENT_ATTACHMENT_CHARS + 16),
+                estimated_chars: MAX_AGENT_ATTACHMENT_CHARS + 16,
+            }],
+        );
+
+        let message = &session.messages[0];
+        assert!(message.content.len() <= MAX_AGENT_MESSAGE_CHARS + "\n[truncated]".len());
+        assert!(message.content.ends_with("[truncated]"));
+        assert!(
+            message.attachments[0].content.len()
+                <= MAX_AGENT_ATTACHMENT_CHARS + "\n[truncated]".len()
+        );
+        assert!(message.attachments[0].content.ends_with("[truncated]"));
+    }
 
     #[test]
     fn lsp_semantic_token_decoder_uses_ty_legend() {

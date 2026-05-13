@@ -378,6 +378,60 @@ type EditorDocument = FileDocument & {
   installEvents: PythonImportEvent[];
 };
 
+type LanguageProviderAvailability = "active" | "degraded" | "missing" | "unsupported";
+
+type LanguageFeature =
+  | "diagnostics"
+  | "hover"
+  | "outline"
+  | "workspaceSymbols"
+  | "documentSymbols"
+  | "semanticTokens"
+  | "formatting"
+  | "organizeImports"
+  | "codeActions"
+  | "references"
+  | "rename";
+
+type LanguageCapabilityStatus = {
+  languageId: string;
+  providerName: string;
+  availability: LanguageProviderAvailability;
+  resolvedPath: string | null;
+  supportedFeatures: LanguageFeature[];
+  inactiveReason: string | null;
+  recommendedAction: string | null;
+};
+
+type AgentSessionRole = "user" | "assistant" | "system";
+type AgentSessionRunState = "idle" | "running" | "awaitingApproval" | "error";
+
+type AgentContextAttachment = {
+  kind: string;
+  label: string;
+  content: string;
+  estimatedChars: number;
+};
+
+type AgentSessionMessage = {
+  id: string;
+  role: AgentSessionRole;
+  content: string;
+  attachments: AgentContextAttachment[];
+  createdAtMs: number;
+};
+
+type AgentSession = {
+  id: string;
+  providerId: string;
+  modelId: string | null;
+  permissionLevel: string;
+  workspaceRoot: string | null;
+  state: AgentSessionRunState;
+  activeTurnId: string | null;
+  messages: AgentSessionMessage[];
+};
+
 type DirectoryState = {
   entries: FileEntry[];
   loaded: boolean;
@@ -564,7 +618,15 @@ const PERSISTED_APP_STATE_KEY = "hematite.app-state.v1";
 const MAX_CACHED_DIRECTORY_COUNT = 18;
 const MAX_CACHED_DIRECTORY_ENTRIES = 160;
 const MAX_CACHED_DOCUMENT_CHARS = 160_000;
+const MAX_TERMINAL_ENTRIES = 40;
+const MAX_TERMINAL_OUTPUT_CHARS = 80_000;
 let persistedAppStateFlushHandle: number | null = null;
+
+function truncateUiText(value: string, maxChars: number) {
+  return value.length > maxChars
+    ? `${value.slice(0, maxChars)}\n[truncated]`
+    : value;
+}
 
 function queuePersistedAppStateWrite(state: PersistedAppState) {
   if (typeof window === "undefined") {
@@ -1035,6 +1097,69 @@ function diagnosticBadgeTone(stats: ReturnType<typeof summarizeDiagnostics>) {
   return "muted";
 }
 
+function languageCapabilityTone(statuses: LanguageCapabilityStatus[], languageId: string) {
+  const matching = statuses.filter((status) => status.languageId === languageId);
+  if (!matching.length) {
+    return "muted";
+  }
+
+  if (matching.some((status) => status.availability === "active")) {
+    return "ready";
+  }
+
+  if (matching.some((status) => status.availability === "degraded")) {
+    return "partial";
+  }
+
+  if (matching.some((status) => status.availability === "missing")) {
+    return "warning";
+  }
+
+  return "muted";
+}
+
+function languageCapabilitySummary(statuses: LanguageCapabilityStatus[], languageId: string) {
+  const matching = statuses.filter((status) => status.languageId === languageId);
+  if (!matching.length) {
+    return "No language provider is registered for this file type.";
+  }
+
+  const active = matching.filter((status) => status.availability === "active");
+  if (active.length) {
+    const features = new Set(active.flatMap((status) => status.supportedFeatures));
+    return `${active.map((status) => status.providerName).join(", ")} active: ${
+      features.size ? [...features].join(", ") : "provider ready"
+    }.`;
+  }
+
+  const degraded = matching.find((status) => status.availability === "degraded");
+  if (degraded) {
+    return `${degraded.providerName} degraded: ${
+      degraded.inactiveReason ?? degraded.recommendedAction ?? "project metadata is incomplete"
+    }.`;
+  }
+
+  const missing = matching.find((status) => status.availability === "missing");
+  if (missing) {
+    return `${missing.providerName} missing: ${
+      missing.recommendedAction ?? missing.inactiveReason ?? "install the provider to enable support"
+    }.`;
+  }
+
+  return "Language support is not enabled for this file type.";
+}
+
+function formatSessionTime(createdAtMs: number) {
+  if (!Number.isFinite(createdAtMs) || createdAtMs <= 0) {
+    return "";
+  }
+
+  return new Date(createdAtMs).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 function resetLineJump(setter: (value: number | null) => void, line: number) {
   setter(null);
   queueMicrotask(() => setter(line));
@@ -1124,6 +1249,12 @@ export default function App() {
   const [includeCompactContext, setIncludeCompactContext] = createSignal(true);
   const [isRunningAgent, setIsRunningAgent] = createSignal(false);
   const [chatMessages, setChatMessages] = createSignal<ChatMessage[]>([createSystemMessage()]);
+  const [agentSession, setAgentSession] = createSignal<AgentSession | null>(null);
+  const [agentSessionInput, setAgentSessionInput] = createSignal("");
+  const [attachActiveFile, setAttachActiveFile] = createSignal(true);
+  const [attachSelectedText, setAttachSelectedText] = createSignal(true);
+  const [attachDiagnostics, setAttachDiagnostics] = createSignal(true);
+  const [attachOpenTabs, setAttachOpenTabs] = createSignal(false);
   const [activeCodexAssistantMessageId, setActiveCodexAssistantMessageId] =
     createSignal<string | null>(null);
   const [activeCodexTurnId, setActiveCodexTurnId] = createSignal<string | null>(null);
@@ -1139,6 +1270,10 @@ export default function App() {
     createSignal<RustEnvironmentStatus | null>(null);
   const [cFamilyEnvironment, setCFamilyEnvironment] =
     createSignal<CFamilyEnvironmentStatus | null>(null);
+  const [languageCapabilities, setLanguageCapabilities] = createSignal<
+    LanguageCapabilityStatus[]
+  >([]);
+  const [languageCapabilityStatus, setLanguageCapabilityStatus] = createSignal("");
   const [isPreparingPythonEnvironment, setIsPreparingPythonEnvironment] =
     createSignal(false);
   const [prepareOutcome, setPrepareOutcome] = createSignal<ProcessOutcome | null>(null);
@@ -1230,6 +1365,20 @@ export default function App() {
     const agent = selectedAgent();
     const selectedModelId = selectedAgentModels[agent.id] ?? defaultAgentModel(agent)?.id ?? "";
     return agent.models?.find((model) => model.id === selectedModelId) ?? defaultAgentModel(agent);
+  });
+
+  const activeLanguageCapabilityTone = createMemo(() => {
+    const document = activeDocument();
+    return document
+      ? languageCapabilityTone(languageCapabilities(), document.language)
+      : "muted";
+  });
+
+  const activeLanguageCapabilitySummary = createMemo(() => {
+    const document = activeDocument();
+    return document
+      ? languageCapabilitySummary(languageCapabilities(), document.language)
+      : "Open a file to inspect language support.";
   });
 
   const activeInstallEvents = createMemo(() => activeDocument()?.installEvents ?? []);
@@ -1481,6 +1630,8 @@ export default function App() {
 
     await resetCodexBackend(workspace);
     await resetGeminiBackend(workspace);
+    setAgentSession(null);
+    setAgentSessionInput("");
     resetChat(workspace);
     setStatus("Started a fresh agent chat.");
   }
@@ -1622,6 +1773,25 @@ export default function App() {
       setCFamilyEnvironment(status);
     } catch (error) {
       setStatus(`Could not inspect C/C++/CUDA toolchains: ${String(error)}`);
+    }
+  }
+
+  async function refreshLanguageCapabilities(root: string | undefined = workspaceRoot()) {
+    if (!root) {
+      setLanguageCapabilities([]);
+      setLanguageCapabilityStatus("Open a workspace to inspect language providers.");
+      return;
+    }
+
+    try {
+      const capabilities = await invokeCommand<LanguageCapabilityStatus[]>(
+        "get_language_capabilities",
+        { workspace: root }
+      );
+      setLanguageCapabilities(capabilities);
+      setLanguageCapabilityStatus("Language capabilities refreshed.");
+    } catch (error) {
+      setLanguageCapabilityStatus(String(error));
     }
   }
 
@@ -2061,10 +2231,14 @@ export default function App() {
     setIsHydratingWorkspaceState(true);
     setStatus(`Scanning ${trimmed}...`);
     setWorkspaceInput(trimmed);
-    setCompactContext("");
-    setVenvPathHint("");
-    setSymbols([]);
-    setJumpToLine(null);
+      setCompactContext("");
+      setVenvPathHint("");
+      setSymbols([]);
+      setAgentSession(null);
+      setAgentSessionInput("");
+      setLanguageCapabilities([]);
+      setLanguageCapabilityStatus("Refreshing language capabilities...");
+      setJumpToLine(null);
     setPrepareOutcome(null);
     setRustToolingOutcome(null);
     setPythonToolingOutcome(null);
@@ -2158,6 +2332,7 @@ export default function App() {
             refreshPythonEnvironment(root),
             refreshRustEnvironment(root),
             refreshCFamilyEnvironment(root),
+            refreshLanguageCapabilities(root),
           ]);
         })();
       }, 720);
@@ -2338,18 +2513,20 @@ export default function App() {
         }
       );
 
-      setTerminalEntries((entries) => [
-        ...entries,
-        {
-          id: makeId(),
-          command: response.command,
-          stdout: response.stdout,
-          stderr: response.stderr,
-          cwd: response.cwd,
-          success: response.success,
-          timestamp: formatTime(),
-        },
-      ]);
+      setTerminalEntries((entries) =>
+        [
+          ...entries,
+          {
+            id: makeId(),
+            command: response.command,
+            stdout: truncateUiText(response.stdout, MAX_TERMINAL_OUTPUT_CHARS),
+            stderr: truncateUiText(response.stderr, MAX_TERMINAL_OUTPUT_CHARS),
+            cwd: response.cwd,
+            success: response.success,
+            timestamp: formatTime(),
+          },
+        ].slice(-MAX_TERMINAL_ENTRIES)
+      );
       setTerminalCwd(response.cwd || cwd);
       setTerminalInput("");
       setStatus(
@@ -2359,18 +2536,20 @@ export default function App() {
       );
     } catch (error) {
       const message = String(error);
-      setTerminalEntries((entries) => [
-        ...entries,
-        {
-          id: makeId(),
-          command,
-          stdout: "",
-          stderr: message,
-          cwd,
-          success: false,
-          timestamp: formatTime(),
-        },
-      ]);
+      setTerminalEntries((entries) =>
+        [
+          ...entries,
+          {
+            id: makeId(),
+            command,
+            stdout: "",
+            stderr: truncateUiText(message, MAX_TERMINAL_OUTPUT_CHARS),
+            cwd,
+            success: false,
+            timestamp: formatTime(),
+          },
+        ].slice(-MAX_TERMINAL_ENTRIES)
+      );
       setStatus(`Could not run terminal command: ${message}`);
     } finally {
       setIsRunningTerminal(false);
@@ -2618,6 +2797,185 @@ export default function App() {
     } catch (error) {
       updateApprovalState(approval.requestId, "pending");
       setStatus(`Could not send the approval response: ${String(error)}`);
+    }
+  }
+
+  function buildAgentContextAttachments(input: {
+    activeDocument: EditorDocument | null;
+    selectedText: string;
+    includeActiveFile: boolean;
+    includeSelectedText: boolean;
+    includeDiagnostics: boolean;
+    includeOpenTabs: boolean;
+  }): AgentContextAttachment[] {
+    const attachments: AgentContextAttachment[] = [];
+
+    if (input.includeActiveFile && input.activeDocument) {
+      attachments.push({
+        kind: "activeFile",
+        label: input.activeDocument.path,
+        content: input.activeDocument.content,
+        estimatedChars: input.activeDocument.content.length,
+      });
+    }
+
+    if (input.includeSelectedText && input.selectedText) {
+      attachments.push({
+        kind: "selectedText",
+        label: "Selected text",
+        content: input.selectedText,
+        estimatedChars: input.selectedText.length,
+      });
+    }
+
+    if (
+      input.includeDiagnostics &&
+      input.activeDocument &&
+      input.activeDocument.diagnostics.length > 0
+    ) {
+      const content = input.activeDocument.diagnostics
+        .map(
+          (diagnostic) =>
+            `${diagnostic.severity} ${diagnostic.line}:${diagnostic.column} ${
+              diagnostic.module
+            } ${diagnostic.message}`
+        )
+        .join("\n");
+      attachments.push({
+        kind: "diagnostics",
+        label: `${input.activeDocument.name} diagnostics`,
+        content,
+        estimatedChars: content.length,
+      });
+    }
+
+    if (input.includeOpenTabs) {
+      const content = openTabs()
+        .map((path) => documents[path])
+        .filter((document): document is EditorDocument => Boolean(document))
+        .map((document) => `${document.path}${document.dirty ? " *" : ""}`)
+        .join("\n");
+
+      if (content) {
+        attachments.push({
+          kind: "openTabs",
+          label: "Open tabs",
+          content,
+          estimatedChars: content.length,
+        });
+      }
+    }
+
+    return attachments;
+  }
+
+  function currentSelectedText() {
+    if (typeof window === "undefined") {
+      return "";
+    }
+    return window.getSelection()?.toString().trim() ?? "";
+  }
+
+  const pendingAgentAttachments = createMemo(() =>
+    buildAgentContextAttachments({
+      activeDocument: activeDocument() ?? null,
+      selectedText: currentSelectedText(),
+      includeActiveFile: attachActiveFile(),
+      includeSelectedText: attachSelectedText(),
+      includeDiagnostics: attachDiagnostics(),
+      includeOpenTabs: attachOpenTabs(),
+    })
+  );
+
+  const pendingAgentAttachmentChars = createMemo(() =>
+    pendingAgentAttachments().reduce(
+      (total, attachment) => total + attachment.estimatedChars,
+      0
+    )
+  );
+
+  async function ensureAgentSession() {
+    const agent = selectedAgent();
+    const modelId = selectedAgentModel()?.id || null;
+    const root = workspaceRoot() || null;
+    const current = agentSession();
+
+    if (
+      current &&
+      current.providerId === agent.id &&
+      current.modelId === modelId &&
+      current.workspaceRoot === root
+    ) {
+      return current;
+    }
+
+    const session = await invokeCommand<AgentSession>("create_agent_session", {
+      request: {
+        providerId: agent.id,
+        modelId,
+        permissionLevel: "workspace-write",
+        workspaceRoot: root,
+      },
+    });
+    setAgentSession(session);
+    return session;
+  }
+
+  async function sendAgentSessionMessage() {
+    if (!workspaceRoot()) {
+      setStatus("Open a workspace before starting an agent session.");
+      return;
+    }
+
+    if (selectedAgentStatus()?.authState !== "ready") {
+      setStatus(`${selectedAgent().label} needs access before it can run.`);
+      return;
+    }
+
+    const content = agentSessionInput().trim();
+    if (!content) {
+      setStatus("Write a message before sending it to the selected agent.");
+      return;
+    }
+
+    try {
+      const session = await ensureAgentSession();
+      const updated = await invokeCommand<AgentSession>("send_agent_session_message", {
+        request: {
+          sessionId: session.id,
+          content,
+          attachments: buildAgentContextAttachments({
+            activeDocument: activeDocument() ?? null,
+            selectedText: currentSelectedText(),
+            includeActiveFile: attachActiveFile(),
+            includeSelectedText: attachSelectedText(),
+            includeDiagnostics: attachDiagnostics(),
+            includeOpenTabs: attachOpenTabs(),
+          }),
+        },
+      });
+      setAgentSession(updated);
+      setAgentSessionInput("");
+      setStatus(`Sent message to ${selectedAgent().label}.`);
+    } catch (error) {
+      setStatus(`Could not send agent message: ${String(error)}`);
+    }
+  }
+
+  async function cancelAgentSessionTurn() {
+    const session = agentSession();
+    if (!session || session.state !== "running") {
+      return;
+    }
+
+    try {
+      const updated = await invokeCommand<AgentSession>("cancel_agent_session_turn", {
+        request: { sessionId: session.id },
+      });
+      setAgentSession(updated);
+      setStatus(`Cancelled ${selectedAgent().label} turn.`);
+    } catch (error) {
+      setStatus(`Could not cancel agent turn: ${String(error)}`);
     }
   }
 
@@ -3243,7 +3601,6 @@ export default function App() {
 
     if (!document || document.language !== "python" || !root) {
       if (document && document.language !== "python") {
-        setDocuments(document.path, "diagnostics", []);
         setDocuments(document.path, "installEvents", []);
       }
       return;
@@ -3343,66 +3700,96 @@ export default function App() {
     persistWorkspaceSession(root);
   });
 
-  onMount(async () => {
-    const unlisten = await listen<MenuEventPayload>("hematite://menu", (event) => {
-      handleMenuAction(event.payload.id);
-    });
-    onCleanup(() => void unlisten());
+  onMount(() => {
+    let disposed = false;
+    const cleanups: Array<() => void> = [];
+    const timeoutHandles: number[] = [];
 
-    const unlistenCodex = await listen<CodexFrontendEvent>("hematite://codex", (event) => {
-      handleCodexEvent(event.payload);
-    });
-    onCleanup(() => void unlistenCodex());
-
-    const unlistenGemini = await listen<GeminiFrontendEvent>("hematite://gemini", (event) => {
-      handleGeminiEvent(event.payload);
-    });
-    onCleanup(() => void unlistenGemini());
-
-    try {
-      const storedState = await invokeCommand<string | null>("load_ui_state");
-      if (storedState) {
-        window.localStorage.setItem(PERSISTED_APP_STATE_KEY, storedState);
+    onCleanup(() => {
+      disposed = true;
+      for (const cleanup of cleanups.splice(0)) {
+        cleanup();
       }
-    } catch {
-      // Fall back to localStorage-only restore if backend persistence is unavailable.
-    }
+      for (const handle of timeoutHandles.splice(0)) {
+        window.clearTimeout(handle);
+      }
+    });
 
-    const payload = await invokeCommand<BootstrapPayload>("bootstrap");
-    const persisted = loadPersistedAppState();
-    const initialWorkspace = persisted.lastWorkspace.trim() || payload.defaultRoot;
-    setWorkspaceInput(initialWorkspace);
-    setStatus(`Ready. Opening ${basename(initialWorkspace)}...`);
-
-    const editorPreloadHandle = window.setTimeout(() => {
-      void import("./components/CodeEditor");
-    }, 120);
-
-    const bootHandle = window.setTimeout(() => {
-      void (async () => {
-        const opened = await openWorkspace(initialWorkspace);
-        if (!opened && initialWorkspace !== payload.defaultRoot) {
-          setWorkspaceInput(payload.defaultRoot);
-          setStatus(`Falling back to ${basename(payload.defaultRoot)}...`);
-          await openWorkspace(payload.defaultRoot);
-        }
-      })();
-    }, 90);
-
-    const toolHandle = window.setTimeout(() => {
-      void refreshToolStatuses();
-    }, 650);
-
-    const refreshHandle = window.setTimeout(() => {
-      void refreshAgentHealth().catch((error) => {
-        setStatus(`Could not refresh agent access: ${String(error)}`);
+    void (async () => {
+      const unlisten = await listen<MenuEventPayload>("hematite://menu", (event) => {
+        handleMenuAction(event.payload.id);
       });
-    }, 1350);
+      if (disposed) {
+        unlisten();
+        return;
+      }
+      cleanups.push(() => void unlisten());
 
-    onCleanup(() => window.clearTimeout(editorPreloadHandle));
-    onCleanup(() => window.clearTimeout(bootHandle));
-    onCleanup(() => window.clearTimeout(toolHandle));
-    onCleanup(() => window.clearTimeout(refreshHandle));
+      const unlistenCodex = await listen<CodexFrontendEvent>("hematite://codex", (event) => {
+        handleCodexEvent(event.payload);
+      });
+      if (disposed) {
+        unlistenCodex();
+        return;
+      }
+      cleanups.push(() => void unlistenCodex());
+
+      const unlistenGemini = await listen<GeminiFrontendEvent>("hematite://gemini", (event) => {
+        handleGeminiEvent(event.payload);
+      });
+      if (disposed) {
+        unlistenGemini();
+        return;
+      }
+      cleanups.push(() => void unlistenGemini());
+
+      try {
+        const storedState = await invokeCommand<string | null>("load_ui_state");
+        if (storedState && !disposed) {
+          window.localStorage.setItem(PERSISTED_APP_STATE_KEY, storedState);
+        }
+      } catch {
+        // Fall back to localStorage-only restore if backend persistence is unavailable.
+      }
+
+      if (disposed) {
+        return;
+      }
+
+      const payload = await invokeCommand<BootstrapPayload>("bootstrap");
+      if (disposed) {
+        return;
+      }
+      const persisted = loadPersistedAppState();
+      const initialWorkspace = persisted.lastWorkspace.trim() || payload.defaultRoot;
+      setWorkspaceInput(initialWorkspace);
+      setStatus(`Ready. Opening ${basename(initialWorkspace)}...`);
+
+      timeoutHandles.push(window.setTimeout(() => {
+        void import("./components/CodeEditor");
+      }, 120));
+
+      timeoutHandles.push(window.setTimeout(() => {
+        void (async () => {
+          const opened = await openWorkspace(initialWorkspace);
+          if (!opened && initialWorkspace !== payload.defaultRoot) {
+            setWorkspaceInput(payload.defaultRoot);
+            setStatus(`Falling back to ${basename(payload.defaultRoot)}...`);
+            await openWorkspace(payload.defaultRoot);
+          }
+        })();
+      }, 90));
+
+      timeoutHandles.push(window.setTimeout(() => {
+        void refreshToolStatuses();
+      }, 650));
+
+      timeoutHandles.push(window.setTimeout(() => {
+        void refreshAgentHealth().catch((error) => {
+          setStatus(`Could not refresh agent access: ${String(error)}`);
+        });
+      }, 1350));
+    })();
   });
 
   const renderTree = (entry: FileEntry, depth = 0) => (
@@ -4092,6 +4479,8 @@ export default function App() {
                           }`}
                           onClick={() => {
                             setSelectedAgentId(agent.id);
+                            setAgentSession(null);
+                            setAgentSessionInput("");
                             setStatus(`Selected ${agent.label}.`);
                           }}
                         >
@@ -4123,6 +4512,122 @@ export default function App() {
                     </label>
                   </div>
                 </Show>
+
+                <section class="agent-session-panel">
+                  <div class="agent-session-toolbar">
+                    <div class="agent-session-state">
+                      <span class={`state-badge ${agentSession()?.state === "running" ? "partial" : "muted"}`}>
+                        {agentSession()?.state ?? "idle"}
+                      </span>
+                      <span>{agentSession()?.activeTurnId ? "turn active" : "session ready"}</span>
+                    </div>
+                    <button
+                      type="button"
+                      class="ghost-button"
+                      disabled={agentSession()?.state !== "running"}
+                      onClick={() => void cancelAgentSessionTurn()}
+                    >
+                      Cancel
+                    </button>
+                  </div>
+
+                  <div class="agent-attachment-row">
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={attachActiveFile()}
+                        onChange={(event) => setAttachActiveFile(event.currentTarget.checked)}
+                      />
+                      Active file
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={attachSelectedText()}
+                        onChange={(event) => setAttachSelectedText(event.currentTarget.checked)}
+                      />
+                      Selection
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={attachDiagnostics()}
+                        onChange={(event) => setAttachDiagnostics(event.currentTarget.checked)}
+                      />
+                      Diagnostics
+                    </label>
+                    <label>
+                      <input
+                        type="checkbox"
+                        checked={attachOpenTabs()}
+                        onChange={(event) => setAttachOpenTabs(event.currentTarget.checked)}
+                      />
+                      Open tabs
+                    </label>
+                  </div>
+                  <div class="agent-attachment-summary">
+                    {pendingAgentAttachments().length} attachments ·{" "}
+                    {pendingAgentAttachmentChars().toLocaleString()} chars
+                  </div>
+
+                  <div class="agent-session-messages">
+                    <Show
+                      when={agentSession()?.messages.length}
+                      fallback={<div class="empty-note">No session messages yet.</div>}
+                    >
+                      <For each={agentSession()?.messages ?? []}>
+                        {(message) => (
+                          <article class={`agent-session-message ${message.role}`}>
+                            <div class="agent-session-message-meta">
+                              <span>{message.role === "user" ? "You" : selectedAgent().label}</span>
+                              <span>{formatSessionTime(message.createdAtMs)}</span>
+                            </div>
+                            <div class="agent-session-message-copy">{message.content}</div>
+                            <Show when={message.attachments.length}>
+                              <div class="agent-session-attachments">
+                                <For each={message.attachments}>
+                                  {(attachment) => (
+                                    <span title={attachment.label}>
+                                      {attachment.kind} ({attachment.estimatedChars})
+                                    </span>
+                                  )}
+                                </For>
+                              </div>
+                            </Show>
+                          </article>
+                        )}
+                      </For>
+                    </Show>
+                  </div>
+
+                  <textarea
+                    ref={chatInputRef}
+                    class="agent-session-input"
+                    value={agentSessionInput()}
+                    placeholder={`Ask ${selectedAgent().label}...`}
+                    onInput={(event) => setAgentSessionInput(event.currentTarget.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        void sendAgentSessionMessage();
+                      }
+                    }}
+                  />
+
+                  <div class="agent-session-actions">
+                    <button
+                      type="button"
+                      class="command-button accent"
+                      disabled={
+                        agentSession()?.state === "running" ||
+                        selectedAgentStatus()?.authState !== "ready"
+                      }
+                      onClick={() => void sendAgentSessionMessage()}
+                    >
+                      {agentSession()?.state === "running" ? "Running..." : "Send"}
+                    </button>
+                  </div>
+                </section>
 
                 <div class="chat-stream">
                   <Show when={selectedAgentStatus()?.authState !== "ready"}>
@@ -4327,7 +4832,7 @@ export default function App() {
                           type="button"
                           class="quick-prompt"
                           onClick={() => {
-                            setChatDraft(prompt);
+                            setAgentSessionInput(prompt);
                             chatInputRef?.focus();
                           }}
                         >
@@ -4340,18 +4845,17 @@ export default function App() {
                   <div class="chat-composer">
                     <label class="form-field">
                       <span>Message</span>
-                      <textarea
-                        ref={chatInputRef}
-                        value={chatDraft()}
-                        placeholder={`Ask ${selectedAgent().label} to review code, explain a file, or suggest the next step...`}
-                        onInput={(event) => setChatDraft(event.currentTarget.value)}
-                        onKeyDown={(event) => {
-                          if (event.key === "Enter" && !event.shiftKey) {
-                            event.preventDefault();
-                            void runAgentChat();
-                          }
-                        }}
-                      />
+                        <textarea
+                          value={agentSessionInput()}
+                          placeholder={`Ask ${selectedAgent().label} to review code, explain a file, or suggest the next step...`}
+                          onInput={(event) => setAgentSessionInput(event.currentTarget.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && !event.shiftKey) {
+                              event.preventDefault();
+                              void sendAgentSessionMessage();
+                            }
+                          }}
+                        />
                     </label>
 
                     <div class="chat-composer-footer">
@@ -4375,26 +4879,21 @@ export default function App() {
                       </div>
 
                       <div class="chat-actions">
-                        <label class="toggle-row compact">
-                          <input
-                            type="checkbox"
-                            checked={includeCompactContext()}
-                            onChange={(event) =>
-                              setIncludeCompactContext(event.currentTarget.checked)
-                            }
-                          />
-                          <span>Context</span>
-                        </label>
+                        <span class="chat-context-summary">
+                          {pendingAgentAttachments().length} attachments ·{" "}
+                          {pendingAgentAttachmentChars().toLocaleString()} chars
+                        </span>
 
                         <button
                           type="button"
                           class="command-button accent"
                           disabled={
-                            isRunningAgent() || selectedAgentStatus()?.authState !== "ready"
+                            agentSession()?.state === "running" ||
+                            selectedAgentStatus()?.authState !== "ready"
                           }
-                          onClick={() => void runAgentChat()}
+                          onClick={() => void sendAgentSessionMessage()}
                         >
-                          {isRunningAgent() ? "Sending..." : "Send"}
+                          {agentSession()?.state === "running" ? "Running..." : "Send"}
                         </button>
                       </div>
                     </div>
@@ -4420,6 +4919,7 @@ export default function App() {
                         refreshPythonEnvironment(),
                         refreshRustEnvironment(),
                         refreshCFamilyEnvironment(),
+                        refreshLanguageCapabilities(),
                       ])
                     }
                   >
@@ -4433,6 +4933,24 @@ export default function App() {
                     {workspaceRoot() || "No workspace selected"}
                   </div>
                 </article>
+
+                <div class="language-capability-strip">
+                  <span class={`state-badge ${activeLanguageCapabilityTone()}`}>
+                    {activeDocument()?.language ?? "none"}
+                  </span>
+                  <span class="language-capability-copy">
+                    {activeLanguageCapabilitySummary()}
+                  </span>
+                  <button
+                    type="button"
+                    class="ghost-button"
+                    disabled={!workspaceRoot()}
+                    title={languageCapabilityStatus() || "Refresh language capability status"}
+                    onClick={() => void refreshLanguageCapabilities()}
+                  >
+                    Refresh
+                  </button>
+                </div>
 
                 <article class="status-card">
                   <div class="status-card-head">

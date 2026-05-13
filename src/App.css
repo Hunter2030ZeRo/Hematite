@@ -210,6 +210,28 @@ pre {
   cursor: not-allowed;
 }
 
+.ghost-button {
+  min-height: 28px;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  padding: 4px 8px;
+  font-size: 0.78rem;
+  cursor: pointer;
+}
+
+.ghost-button:hover:enabled {
+  color: var(--text);
+  border-color: var(--border);
+  background: #1a2230;
+}
+
+.ghost-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .command-button.accent,
 .pane-button.active,
 .utility-tab.active {
@@ -785,6 +807,23 @@ pre {
   color: var(--subtle);
 }
 
+.language-capability-strip {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #151b26;
+  padding: 8px 10px;
+}
+
+.language-capability-copy {
+  min-width: 0;
+  color: var(--muted);
+  line-height: 1.35;
+}
+
 .toggle-row {
   display: flex;
   align-items: center;
@@ -1010,6 +1049,120 @@ pre {
   flex-direction: column;
   gap: 12px;
   overflow: visible;
+}
+
+.agent-session-panel {
+  display: grid;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #141b26;
+  padding: 10px;
+}
+
+.agent-session-toolbar,
+.agent-session-state,
+.agent-attachment-row,
+.agent-session-actions,
+.agent-session-message-meta,
+.agent-session-attachments {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.agent-session-toolbar {
+  justify-content: space-between;
+}
+
+.agent-session-state {
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.agent-attachment-row {
+  flex-wrap: wrap;
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.agent-attachment-row label {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.agent-attachment-summary,
+.chat-context-summary {
+  color: var(--muted);
+  font-size: 0.76rem;
+}
+
+.agent-session-messages {
+  display: grid;
+  gap: 8px;
+  max-height: 220px;
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.agent-session-message {
+  display: grid;
+  gap: 5px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  background: #111722;
+  padding: 8px;
+}
+
+.agent-session-message.user {
+  background: rgba(55, 148, 255, 0.1);
+}
+
+.agent-session-message-meta {
+  justify-content: space-between;
+  color: var(--subtle);
+  font-size: 0.72rem;
+}
+
+.agent-session-message-copy {
+  color: var(--text);
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+
+.agent-session-attachments {
+  flex-wrap: wrap;
+}
+
+.agent-session-attachments span {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  padding: 2px 6px;
+  font-size: 0.7rem;
+}
+
+.agent-session-input {
+  width: 100%;
+  min-height: 64px;
+  max-height: 128px;
+  resize: vertical;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: #101722;
+  color: var(--text);
+  padding: 8px;
+  font: inherit;
+}
+
+.agent-session-input::placeholder {
+  color: var(--subtle);
+}
+
+.agent-session-actions {
+  justify-content: flex-end;
 }
 
 .chat-notice {
@@ -2001,6 +2154,8 @@ pre {
   border-radius: 3px;
   background: #111111;
   border-color: #333333;
+  max-height: 240px;
+  overflow: auto;
 }
 
 .terminal-input-shell {
