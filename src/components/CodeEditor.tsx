@@ -5,9 +5,10 @@ import {
   type Extension,
   type Text,
 } from "@codemirror/state";
+import { autocompletion, type CompletionContext } from "@codemirror/autocomplete";
 import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { lintGutter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
-import { Decoration, EditorView, hoverTooltip, keymap } from "@codemirror/view";
+import { Decoration, EditorView, WidgetType, hoverTooltip, keymap } from "@codemirror/view";
 import { indentWithTab } from "@codemirror/commands";
 import { tags } from "@lezer/highlight";
 import { basicSetup } from "codemirror";
@@ -39,13 +40,47 @@ type EditorHoverRequest = {
   column: number;
 };
 
+type EditorCompletionItem = {
+  label: string;
+  detail?: string | null;
+  kind: string;
+  insertText?: string | null;
+};
+
+type EditorCodeAction = {
+  title: string;
+  kind?: string | null;
+  isPreferred: boolean;
+};
+
+type EditorLocation = {
+  uri: string;
+  path?: string | null;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+};
+
+type EditorInlayHint = {
+  label: string;
+  line: number;
+  column: number;
+  kind: string;
+};
+
 type CodeEditorProps = {
   value: string;
   path: string;
   diagnostics: Diagnostic[];
   semanticTokens: EditorSemanticToken[];
+  inlayHints: EditorInlayHint[];
   lineWrapping: boolean;
   onHover?: (request: EditorHoverRequest) => Promise<EditorHoverItem | null>;
+  onCompletions?: (request: EditorHoverRequest) => Promise<EditorCompletionItem[]>;
+  onCodeActions?: (request: EditorHoverRequest) => Promise<EditorCodeAction[]>;
+  onDefinition?: (request: EditorHoverRequest) => Promise<EditorLocation | null>;
+  onReferences?: (request: EditorHoverRequest) => Promise<EditorLocation[]>;
   jumpToLine: number | null;
   onChange: (value: string) => void;
   onCursorChange?: (line: number, column: number) => void;
@@ -54,6 +89,8 @@ type CodeEditorProps = {
 
 const languageCompartment = new Compartment();
 const semanticCompartment = new Compartment();
+const inlayHintCompartment = new Compartment();
+const languageFeatureCompartment = new Compartment();
 const hoverCompartment = new Compartment();
 const lineWrappingCompartment = new Compartment();
 
@@ -250,6 +287,16 @@ const editorTheme = EditorView.theme(
     ".cm-diagnosticText": {
       "font-family": '"IBM Plex Sans", "Segoe UI", sans-serif',
     },
+    ".cm-inlay-hint": {
+      "margin-left": "6px",
+      padding: "0 5px",
+      "border-radius": "4px",
+      "background-color": "rgba(143, 221, 255, 0.1)",
+      color: "#9fb5cf",
+      "font-size": "12px",
+      "font-style": "normal",
+      "vertical-align": "baseline",
+    },
     ".cm-content .cm-semantic-keyword, .cm-content .cm-semantic-keyword *, .cm-content .cm-semantic-modifier, .cm-content .cm-semantic-modifier *": {
       color: "#ff7ab2 !important",
     },
@@ -398,6 +445,154 @@ function semanticDecorations(tokens: EditorSemanticToken[]): Extension {
     },
     provide: (field) => EditorView.decorations.from(field),
   });
+}
+
+class InlayHintWidget extends WidgetType {
+  constructor(
+    private readonly label: string,
+    private readonly kind: string
+  ) {
+    super();
+  }
+
+  toDOM() {
+    const span = document.createElement("span");
+    span.className = `cm-inlay-hint cm-inlay-hint-${this.kind}`;
+    span.textContent = this.label;
+    return span;
+  }
+
+  ignoreEvent() {
+    return true;
+  }
+}
+
+function inlayHintDecorations(hints: EditorInlayHint[]): Extension {
+  if (!hints.length) {
+    return [];
+  }
+
+  return StateField.define({
+    create(state) {
+      const ranges = hints
+        .map((hint) => {
+          const pos = positionFromLineColumn(state.doc, hint.line, hint.column);
+          return Decoration.widget({
+            widget: new InlayHintWidget(hint.label, hint.kind),
+            side: 1,
+          }).range(pos);
+        })
+        .sort((left, right) => left.from - right.from || left.to - right.to);
+
+      return Decoration.set(ranges, true);
+    },
+    update(value, transaction) {
+      if (!transaction.docChanged) {
+        return value;
+      }
+
+      return value.map(transaction.changes);
+    },
+    provide: (field) => EditorView.decorations.from(field),
+  });
+}
+
+function editorFeatureRequest(view: EditorView, path: string, pos = view.state.selection.main.head) {
+  const line = view.state.doc.lineAt(pos);
+  return {
+    path,
+    content: view.state.doc.toString(),
+    line: line.number,
+    column: pos - line.from + 1,
+  };
+}
+
+function completionType(kind: string) {
+  switch (kind) {
+    case "class":
+    case "function":
+    case "method":
+    case "variable":
+    case "keyword":
+    case "module":
+    case "property":
+      return kind;
+    default:
+      return "variable";
+  }
+}
+
+function pythonCompletions(
+  path: string,
+  onCompletions: CodeEditorProps["onCompletions"]
+) {
+  return async (context: CompletionContext) => {
+    if (!onCompletions || !path.toLowerCase().endsWith(".py")) {
+      return null;
+    }
+
+    const token = context.matchBefore(/[A-Za-z_][\w.]*/);
+    if (!context.explicit && (!token || token.from === token.to)) {
+      return null;
+    }
+
+    const items = await onCompletions(editorFeatureRequest(context.view, path, context.pos));
+    if (!items.length) {
+      return null;
+    }
+
+    return {
+      from: token?.from ?? context.pos,
+      options: items.map((item) => ({
+        label: item.label,
+        type: completionType(item.kind),
+        detail: item.detail ?? undefined,
+        apply: item.insertText ?? item.label,
+      })),
+    };
+  };
+}
+
+function languageFeatureExtensions(props: CodeEditorProps): Extension {
+  const commands = [
+    {
+      key: "F12",
+      run: (view: EditorView) => {
+        if (!props.onDefinition) {
+          return false;
+        }
+        void props.onDefinition(editorFeatureRequest(view, props.path));
+        return true;
+      },
+    },
+    {
+      key: "Shift-F12",
+      run: (view: EditorView) => {
+        if (!props.onReferences) {
+          return false;
+        }
+        void props.onReferences(editorFeatureRequest(view, props.path));
+        return true;
+      },
+    },
+    {
+      key: "Mod-.",
+      run: (view: EditorView) => {
+        if (!props.onCodeActions) {
+          return false;
+        }
+        void props.onCodeActions(editorFeatureRequest(view, props.path));
+        return true;
+      },
+    },
+  ];
+
+  return [
+    autocompletion({
+      override: [pythonCompletions(props.path, props.onCompletions)],
+    }),
+    keymap.of(commands),
+  ];
 }
 
 function hoverTooltips(
@@ -573,6 +768,8 @@ export default function CodeEditor(props: CodeEditorProps) {
           ]),
           languageCompartment.of([]),
           semanticCompartment.of([]),
+          inlayHintCompartment.of([]),
+          languageFeatureCompartment.of(languageFeatureExtensions(props)),
           hoverCompartment.of([]),
           lineWrappingCompartment.of(props.lineWrapping ? EditorView.lineWrapping : []),
           EditorView.updateListener.of((update) => {
@@ -639,6 +836,32 @@ export default function CodeEditor(props: CodeEditorProps) {
 
     view.dispatch({
       effects: semanticCompartment.reconfigure(semanticDecorations(props.semanticTokens)),
+    });
+  });
+
+  createEffect(() => {
+    props.inlayHints;
+    if (!view) {
+      return;
+    }
+
+    view.dispatch({
+      effects: inlayHintCompartment.reconfigure(inlayHintDecorations(props.inlayHints)),
+    });
+  });
+
+  createEffect(() => {
+    props.path;
+    props.onCompletions;
+    props.onCodeActions;
+    props.onDefinition;
+    props.onReferences;
+    if (!view) {
+      return;
+    }
+
+    view.dispatch({
+      effects: languageFeatureCompartment.reconfigure(languageFeatureExtensions(props)),
     });
   });
 

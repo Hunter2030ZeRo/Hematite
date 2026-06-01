@@ -1,6 +1,8 @@
 import type { Diagnostic } from "@codemirror/lint";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { FitAddon } from "@xterm/addon-fit";
+import { Terminal } from "@xterm/xterm";
 import {
   For,
   Show,
@@ -13,6 +15,7 @@ import {
   onMount,
 } from "solid-js";
 import { createStore, reconcile } from "solid-js/store";
+import "@xterm/xterm/css/xterm.css";
 import "./App.css";
 
 type ToolStatus = {
@@ -72,6 +75,35 @@ type EditorHoverRequest = {
   content: string;
   line: number;
   column: number;
+};
+
+type EditorCompletionItem = {
+  label: string;
+  detail?: string | null;
+  kind: string;
+  insertText?: string | null;
+};
+
+type EditorCodeAction = {
+  title: string;
+  kind?: string | null;
+  isPreferred: boolean;
+};
+
+type EditorLocation = {
+  uri: string;
+  path?: string | null;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+};
+
+type EditorInlayHint = {
+  label: string;
+  line: number;
+  column: number;
+  kind: string;
 };
 
 type EditorSemanticsPayload = {
@@ -204,14 +236,41 @@ type ProcessOutcome = {
 };
 
 type PythonToolingAction = "check" | "fixAll" | "format" | "organizeImports" | "typeCheck";
-type RustToolingAction = "check" | "clippy" | "format" | "test" | "build" | "doc" | "metadata";
+type RustToolingAction =
+  | "check"
+  | "clippy"
+  | "format"
+  | "test"
+  | "build"
+  | "doc"
+  | "metadata";
 
-type TerminalCommandResponse = {
-  success: boolean;
-  command: string;
-  stdout: string;
-  stderr: string;
+type TerminalSessionStartResponse = {
+  sessionId: string;
   cwd: string;
+  shell: string;
+};
+
+type TerminalSessionEvent = {
+  sessionId: string;
+  kind: "output" | "exit";
+  data: string;
+  success?: boolean | null;
+};
+
+type CodeShareSession = {
+  sessionId: string;
+  inviteCode: string;
+  inviteLink: string;
+  title: string;
+  root: string;
+  activeFile?: string | null;
+  agentLabel: string;
+  permissionLevel: string;
+  status: string;
+  participantCount: number;
+  createdAt: number;
+  updatedAt: number;
 };
 
 type AgentRunResponse = {
@@ -439,16 +498,6 @@ type DirectoryState = {
   error?: string;
 };
 
-type TerminalEntry = {
-  id: string;
-  command: string;
-  stdout: string;
-  stderr: string;
-  cwd: string;
-  success: boolean;
-  timestamp: string;
-};
-
 type ChatRole = "system" | "user" | "assistant";
 type ChatStatus = "complete" | "running" | "error";
 
@@ -466,7 +515,7 @@ type ChatMessage = {
   approval?: AgentApproval;
 };
 
-type UtilityTab = "chat" | "access" | "project" | "problems" | "outline";
+type UtilityTab = "chat" | "access" | "share" | "project" | "problems" | "outline";
 
 type CredentialsForm = {
   openaiApiKey: string;
@@ -482,6 +531,14 @@ type CredentialsForm = {
 type AgentModelOption = {
   id: string;
   label: string;
+};
+
+type AgentPermissionLevel = "ask" | "autoEdits" | "plan" | "fullAuto";
+
+type AgentPermissionOption = {
+  id: AgentPermissionLevel;
+  label: string;
+  description: string;
 };
 
 type AgentDefinition = {
@@ -598,6 +655,36 @@ const DEFAULT_AGENT_MODELS = Object.fromEntries(
   AGENTS.map((agent) => [agent.id, agent.models?.[0]?.id ?? ""])
 );
 
+const AGENT_PERMISSION_OPTIONS: AgentPermissionOption[] = [
+  {
+    id: "ask",
+    label: "Ask first",
+    description: "Manual approval for command, file, and extra permission requests.",
+  },
+  {
+    id: "autoEdits",
+    label: "Trusted edits",
+    description: "Low-friction file edits while keeping riskier actions reviewable.",
+  },
+  {
+    id: "plan",
+    label: "Plan only",
+    description: "Read-only planning and analysis where the CLI supports it.",
+  },
+  {
+    id: "fullAuto",
+    label: "Full auto",
+    description: "Autonomous execution inside the safest mode each CLI exposes.",
+  },
+];
+
+const DEFAULT_AGENT_PERMISSION_LEVELS: Record<string, AgentPermissionLevel> = {
+  codex: "ask",
+  gemini: "ask",
+  claude: "autoEdits",
+  kilo: "fullAuto",
+};
+
 const QUICK_PROMPTS = [
   "Explain the active file and call out the riskiest part.",
   "Suggest the next concrete implementation step for this project.",
@@ -614,12 +701,108 @@ function defaultAgentModel(agent: AgentDefinition) {
   return agent.models?.[0] ?? null;
 }
 
+function isAgentPermissionLevel(value: string): value is AgentPermissionLevel {
+  return AGENT_PERMISSION_OPTIONS.some((option) => option.id === value);
+}
+
+function defaultAgentPermissionLevel(agent: AgentDefinition): AgentPermissionLevel {
+  return DEFAULT_AGENT_PERMISSION_LEVELS[agent.id] ?? "ask";
+}
+
+function agentPermissionOption(level: AgentPermissionLevel) {
+  return (
+    AGENT_PERMISSION_OPTIONS.find((option) => option.id === level) ??
+    AGENT_PERMISSION_OPTIONS[0]
+  );
+}
+
+function agentPermissionNote(agent: AgentDefinition, level: AgentPermissionLevel) {
+  if (agent.id === "kilo" && level === "autoEdits") {
+    return "Kilo maps trusted edits to manual mode because its CLI exposes ask or full auto.";
+  }
+  if (agent.id === "codex" && level === "autoEdits") {
+    return "Codex uses low-friction sandboxed execution for this level.";
+  }
+  return agentPermissionOption(level).description;
+}
+
+function ActivityIcon(props: {
+  kind: "files" | "agents" | "access" | "codeshare" | "project" | "problems" | "outline";
+}) {
+  switch (props.kind) {
+    case "files":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M3.5 6.5h6l1.8 2h9.2v9.8H3.5z" />
+          <path d="M3.5 8.5v-3h5.7l1.7 2" />
+        </svg>
+      );
+    case "agents":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 4.5v3" />
+          <path d="M6.5 12H4" />
+          <path d="M20 12h-2.5" />
+          <path d="M8.2 16.5l-2 2" />
+          <path d="M15.8 16.5l2 2" />
+          <circle cx="12" cy="12" r="4.7" />
+          <circle cx="12" cy="12" r="1.2" />
+        </svg>
+      );
+    case "access":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M6.5 10V8a5.5 5.5 0 0 1 11 0v2" />
+          <rect x="5" y="10" width="14" height="10" rx="2" />
+          <path d="M12 14v2.8" />
+        </svg>
+      );
+    case "codeshare":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M8.5 8.5h-2a4 4 0 0 0 0 8h2" />
+          <path d="M15.5 8.5h2a4 4 0 0 1 0 8h-2" />
+          <path d="M8 12.5h8" />
+          <path d="M10.5 5.5l3 3-3 3" />
+        </svg>
+      );
+    case "project":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <rect x="4" y="5" width="16" height="14" rx="2" />
+          <path d="M8 9h8" />
+          <path d="M8 13h5" />
+          <path d="M8 17h7" />
+        </svg>
+      );
+    case "problems":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M12 4.5 21 19H3z" />
+          <path d="M12 9.5v4" />
+          <path d="M12 16.8h.01" />
+        </svg>
+      );
+    case "outline":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="M7 6h13" />
+          <path d="M7 12h13" />
+          <path d="M7 18h13" />
+          <circle cx="4" cy="6" r="1" />
+          <circle cx="4" cy="12" r="1" />
+          <circle cx="4" cy="18" r="1" />
+        </svg>
+      );
+  }
+
+  return null;
+}
+
 const PERSISTED_APP_STATE_KEY = "hematite.app-state.v1";
 const MAX_CACHED_DIRECTORY_COUNT = 18;
 const MAX_CACHED_DIRECTORY_ENTRIES = 160;
 const MAX_CACHED_DOCUMENT_CHARS = 160_000;
-const MAX_TERMINAL_ENTRIES = 40;
-const MAX_TERMINAL_OUTPUT_CHARS = 80_000;
 let persistedAppStateFlushHandle: number | null = null;
 
 function truncateUiText(value: string, maxChars: number) {
@@ -941,6 +1124,46 @@ function buildConversationPrompt(messages: ChatMessage[], latestInput: string) {
     .join("\n\n");
 
   return history ? `${history}\n\nUser:\n${latestInput}` : latestInput;
+}
+
+function buildTaskShareDraft(input: {
+  title: string;
+  workspace: string;
+  activeFile?: string | null;
+  agentLabel: string;
+  modelLabel?: string | null;
+  permissionLabel: string;
+  compactContext?: string;
+  messages: ChatMessage[];
+}) {
+  const title = input.title.trim() || "Hematite task handoff";
+  const lines = [
+    `# ${title}`,
+    "",
+    `Workspace: ${input.workspace || "No workspace open"}`,
+    `Active file: ${input.activeFile || "No active file"}`,
+    `Agent: ${input.agentLabel}`,
+    `Model: ${input.modelLabel || "Provider default"}`,
+    `Run access: ${input.permissionLabel}`,
+  ];
+
+  const recentMessages = input.messages
+    .filter((message) => message.role !== "system" && message.status !== "running")
+    .slice(-6);
+
+  if (recentMessages.length) {
+    lines.push("", "## Recent conversation");
+    for (const message of recentMessages) {
+      const speaker = message.role === "user" ? "User" : message.agentLabel ?? "Assistant";
+      lines.push("", `### ${speaker}`, message.content.trim() || "(no text)");
+    }
+  }
+
+  if (input.compactContext?.trim()) {
+    lines.push("", "## Compact context", input.compactContext.trim());
+  }
+
+  return lines.join("\n");
 }
 
 function approvalTitle(approval: AgentApproval) {
@@ -1277,10 +1500,11 @@ export default function App() {
   const [isPreparingPythonEnvironment, setIsPreparingPythonEnvironment] =
     createSignal(false);
   const [prepareOutcome, setPrepareOutcome] = createSignal<ProcessOutcome | null>(null);
-  const [terminalInput, setTerminalInput] = createSignal("");
-  const [isRunningTerminal, setIsRunningTerminal] = createSignal(false);
   const [terminalCwd, setTerminalCwd] = createSignal("");
-  const [terminalEntries, setTerminalEntries] = createSignal<TerminalEntry[]>([]);
+  const [terminalSessionId, setTerminalSessionId] = createSignal<string | null>(null);
+  const [isTerminalStarting, setIsTerminalStarting] = createSignal(false);
+  const [terminalEventsReady, setTerminalEventsReady] = createSignal(false);
+  const [editorInlayHints, setEditorInlayHints] = createSignal<EditorInlayHint[]>([]);
   const [isTerminalVisible, setIsTerminalVisible] = createSignal(true);
   const [explorerWidth, setExplorerWidth] = createSignal(320);
   const [utilityWidth, setUtilityWidth] = createSignal(384);
@@ -1302,6 +1526,8 @@ export default function App() {
   const [documents, setDocuments] = createStore<Record<string, EditorDocument>>({});
   const [selectedAgentModels, setSelectedAgentModels] =
     createStore<Record<string, string>>(DEFAULT_AGENT_MODELS);
+  const [selectedAgentPermissionLevels, setSelectedAgentPermissionLevels] =
+    createStore<Record<string, AgentPermissionLevel>>(DEFAULT_AGENT_PERMISSION_LEVELS);
   const [credentialsForm, setCredentialsForm] = createStore<CredentialsForm>({
     openaiApiKey: "",
     geminiApiKey: "",
@@ -1312,12 +1538,22 @@ export default function App() {
     anthropicApiKey: "",
     kiloApiKey: "",
   });
+  const [shareTitle, setShareTitle] = createSignal("CodeShare session");
+  const [shareIncludeContext, setShareIncludeContext] = createSignal(true);
+  const [shareIncludeRecentChat, setShareIncludeRecentChat] = createSignal(true);
+  const [shareStatus, setShareStatus] = createSignal("");
+  const [codeShareJoinCode, setCodeShareJoinCode] = createSignal("");
+  const [codeShareSession, setCodeShareSession] = createSignal<CodeShareSession | null>(null);
+  const [isStartingCodeShare, setIsStartingCodeShare] = createSignal(false);
+  const [isJoiningCodeShare, setIsJoiningCodeShare] = createSignal(false);
 
   let shellRef: HTMLDivElement | undefined;
   let gridRef: HTMLDivElement | undefined;
   let chatTimelineRef: HTMLDivElement | undefined;
   let chatInputRef: HTMLTextAreaElement | undefined;
-  let terminalLogRef: HTMLDivElement | undefined;
+  let terminalHostRef: HTMLDivElement | undefined;
+  let terminalRef: Terminal | undefined;
+  let terminalFitRef: FitAddon | undefined;
   let newFileInputRef: HTMLInputElement | undefined;
 
   const activeDocument = createMemo(() => {
@@ -1380,6 +1616,15 @@ export default function App() {
       ? languageCapabilitySummary(languageCapabilities(), document.language)
       : "Open a file to inspect language support.";
   });
+
+  const selectedAgentPermissionLevel = createMemo(() => {
+    const agent = selectedAgent();
+    return selectedAgentPermissionLevels[agent.id] ?? defaultAgentPermissionLevel(agent);
+  });
+
+  const selectedAgentPermissionOption = createMemo(() =>
+    agentPermissionOption(selectedAgentPermissionLevel())
+  );
 
   const activeInstallEvents = createMemo(() => activeDocument()?.installEvents ?? []);
 
@@ -1516,15 +1761,15 @@ export default function App() {
       return "Open a workspace to inspect Rust toolchains and run Cargo automation.";
     }
     if (!environment?.cargoTomlExists) {
-      return "Standalone Rust parser support is active. Open a Cargo package or workspace to enable rust-analyzer, Cargo checks, Clippy, tests, docs, and metadata.";
+      return "Standalone Rust parser support is active. Open a Cargo package or workspace to enable rust-analyzer diagnostics, Cargo checks, Clippy, tests, docs, and metadata.";
     }
     if (!document) {
-      return "Open a Rust file to use rust-analyzer hover, semantic coloring, rustfmt, and active-file diagnostics.";
+      return "Open a Rust file to use rust-analyzer hover, semantic coloring, diagnostics, and rustfmt.";
     }
     if (document.language !== "rust") {
-      return "Switch to a Rust file to run Cargo diagnostics and rustfmt against the active source.";
+      return "Switch to a Rust file to run rust-analyzer diagnostics, Cargo checks, and rustfmt against the active source.";
     }
-    return "Rust IDE support is active for the current file. Cargo actions run explicitly so Hematite stays quiet while idle.";
+    return "Rust IDE support is active for the current file. rust-analyzer provides diagnostics, hover, and semantic tokens.";
   });
 
   const cFamilyManagementSummary = createMemo(() => {
@@ -1553,6 +1798,29 @@ export default function App() {
 
   const pendingApprovalCount = createMemo(
     () => chatMessages().filter((message) => message.approval?.state === "pending").length
+  );
+  const latestPendingApproval = createMemo<AgentApproval | null>(() => {
+    const messages = chatMessages();
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const approval = messages[index].approval;
+      if (approval?.state === "pending") {
+        return approval;
+      }
+    }
+    return null;
+  });
+
+  const taskShareDraft = createMemo(() =>
+    buildTaskShareDraft({
+      title: shareTitle(),
+      workspace: workspaceRoot(),
+      activeFile: activeDocument()?.path,
+      agentLabel: selectedAgent().label,
+      modelLabel: selectedAgentModel()?.label,
+      permissionLabel: selectedAgentPermissionOption().label,
+      compactContext: shareIncludeContext() ? compactContext() : "",
+      messages: shareIncludeRecentChat() ? chatMessages() : [],
+    })
   );
 
   function setStatus(message: string) {
@@ -1588,6 +1856,102 @@ export default function App() {
           : message
       )
     );
+  }
+
+  async function copyTaskShareDraft() {
+    try {
+      await navigator.clipboard.writeText(taskShareDraft());
+      setShareStatus("Copied handoff context.");
+      setStatus("Copied handoff context.");
+    } catch (error) {
+      const message = `Could not copy handoff context: ${String(error)}`;
+      setShareStatus(message);
+      setStatus(message);
+    }
+  }
+
+  function queueTaskShareDraftForAgent() {
+    setChatDraft(`Continue from this shared task brief:\n\n${taskShareDraft()}`);
+    setUtilityTab("chat");
+    chatInputRef?.focus();
+    setShareStatus("Queued handoff context in chat.");
+    setStatus("Queued handoff context in chat.");
+  }
+
+  async function startCodeShareSession() {
+    if (!workspaceRoot()) {
+      setShareStatus("Open a workspace before starting CodeShare.");
+      setStatus("Open a workspace before starting CodeShare.");
+      return;
+    }
+
+    setIsStartingCodeShare(true);
+    try {
+      const session = await invokeCommand<CodeShareSession>("start_codeshare_session", {
+        request: {
+          title: shareTitle(),
+          root: workspaceRoot(),
+          activeFile: activeDocument()?.path,
+          agentLabel: selectedAgent().label,
+          permissionLevel: selectedAgentPermissionLevel(),
+        },
+      });
+      setCodeShareSession(session);
+      setShareStatus(`Hosting CodeShare ${session.inviteCode}.`);
+      setStatus(`Hosting CodeShare ${session.inviteCode}.`);
+    } catch (error) {
+      const message = `Could not start CodeShare: ${String(error)}`;
+      setShareStatus(message);
+      setStatus(message);
+    } finally {
+      setIsStartingCodeShare(false);
+    }
+  }
+
+  async function joinCodeShareSession() {
+    const inviteCode = codeShareJoinCode().trim();
+    if (!inviteCode) {
+      setShareStatus("Enter a CodeShare invite code first.");
+      setStatus("Enter a CodeShare invite code first.");
+      return;
+    }
+
+    setIsJoiningCodeShare(true);
+    try {
+      const session = await invokeCommand<CodeShareSession>("join_codeshare_session", {
+        request: {
+          inviteCode,
+        },
+      });
+      setCodeShareSession(session);
+      setShareStatus(`Joined CodeShare ${session.inviteCode}.`);
+      setStatus(`Joined CodeShare ${session.inviteCode}.`);
+    } catch (error) {
+      const message = `Could not join CodeShare: ${String(error)}`;
+      setShareStatus(message);
+      setStatus(message);
+    } finally {
+      setIsJoiningCodeShare(false);
+    }
+  }
+
+  async function copyCodeShareInvite() {
+    const session = codeShareSession();
+    if (!session) {
+      setShareStatus("Start or join CodeShare before copying an invite.");
+      setStatus("Start or join CodeShare before copying an invite.");
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(session.inviteLink);
+      setShareStatus("Copied CodeShare invite.");
+      setStatus("Copied CodeShare invite.");
+    } catch (error) {
+      const message = `Could not copy CodeShare invite: ${String(error)}`;
+      setShareStatus(message);
+      setStatus(message);
+    }
   }
 
   async function resetCodexBackend(root = workspaceRoot()) {
@@ -1820,6 +2184,118 @@ export default function App() {
       });
     } catch {
       return null;
+    }
+  }
+
+  function pythonFeatureRequestPayload(request: EditorHoverRequest) {
+    const root = workspaceRoot();
+    const language = activeDocument()?.language;
+    if (!root || !activeDocument() || language !== "python") {
+      return null;
+    }
+
+    return {
+      request: {
+        root,
+        filePath: request.path,
+        source: request.content,
+        line: request.line,
+        column: request.column,
+      },
+    };
+  }
+
+  async function requestEditorCompletions(
+    request: EditorHoverRequest
+  ): Promise<EditorCompletionItem[]> {
+    const payload = pythonFeatureRequestPayload(request);
+    if (!payload) {
+      return [];
+    }
+
+    try {
+      return await invokeCommand<EditorCompletionItem[]>("request_editor_completions", payload);
+    } catch {
+      return [];
+    }
+  }
+
+  async function requestEditorCodeActions(
+    request: EditorHoverRequest
+  ): Promise<EditorCodeAction[]> {
+    const payload = pythonFeatureRequestPayload(request);
+    if (!payload) {
+      return [];
+    }
+
+    try {
+      const actions = await invokeCommand<EditorCodeAction[]>(
+        "request_editor_code_actions",
+        payload
+      );
+      setStatus(
+        actions.length
+          ? `Python actions: ${actions.map((action) => action.title).join(", ")}`
+          : "No Python code actions at this cursor."
+      );
+      return actions;
+    } catch (error) {
+      setStatus(`Could not request Python code actions: ${String(error)}`);
+      return [];
+    }
+  }
+
+  async function requestEditorDefinition(
+    request: EditorHoverRequest
+  ): Promise<EditorLocation | null> {
+    const payload = pythonFeatureRequestPayload(request);
+    if (!payload) {
+      return null;
+    }
+
+    try {
+      const location = await invokeCommand<EditorLocation | null>(
+        "request_editor_definition",
+        payload
+      );
+      if (location?.path) {
+        await openFile(location.path, true);
+        setJumpToLine(location.line);
+        setStatus(`Opened definition at ${basename(location.path)}:${location.line}.`);
+      } else if (location) {
+        setStatus(`Definition: ${location.uri}:${location.line}`);
+      } else {
+        setStatus("No Python definition found at this cursor.");
+      }
+      return location;
+    } catch (error) {
+      setStatus(`Could not request Python definition: ${String(error)}`);
+      return null;
+    }
+  }
+
+  async function requestEditorReferences(
+    request: EditorHoverRequest
+  ): Promise<EditorLocation[]> {
+    const payload = pythonFeatureRequestPayload(request);
+    if (!payload) {
+      return [];
+    }
+
+    try {
+      const locations = await invokeCommand<EditorLocation[]>(
+        "request_editor_references",
+        payload
+      );
+      setStatus(
+        locations.length
+          ? `Found ${locations.length} Python reference${locations.length === 1 ? "" : "s"}.`
+          : "No Python references found at this cursor."
+      );
+      return locations;
+    } catch (error) {
+      setStatus(`Could not request Python references: ${String(error)}`);
+      return [];
     }
   }
 
@@ -2484,76 +2960,140 @@ export default function App() {
     }
   }
 
-  async function runTerminalCommand() {
-    const command = terminalInput().trim();
-    if (!command) {
-      setStatus("Write a terminal command before running it.");
+  function fitTerminal() {
+    if (!terminalRef || !terminalFitRef) {
       return;
     }
-
-    if (command === "clear" || command === "cls") {
-      setTerminalEntries([]);
-      setTerminalInput("");
-      setStatus("Cleared terminal output.");
-      return;
-    }
-
-    const cwd = terminalCwd() || workspaceRoot() || workspaceInput();
-    setIsRunningTerminal(true);
-    setStatus(`Running terminal command: ${command}`);
 
     try {
-      const response = await invokeCommand<TerminalCommandResponse>(
-        "execute_terminal_command",
+      terminalFitRef.fit();
+      const sessionId = terminalSessionId();
+      if (sessionId) {
+        void invokeCommand<void>("resize_terminal_session", {
+          request: {
+            sessionId,
+            cols: terminalRef.cols,
+            rows: terminalRef.rows,
+          },
+        });
+      }
+    } catch {
+      // The fit addon can throw while the panel is hidden or has zero size.
+    }
+  }
+
+  function ensureTerminalRenderer() {
+    if (terminalRef || !terminalHostRef) {
+      return;
+    }
+
+    const terminal = new Terminal({
+      cursorBlink: true,
+      fontFamily:
+        "'Cascadia Mono', 'Cascadia Code', Consolas, 'SFMono-Regular', monospace",
+      fontSize: 14,
+      lineHeight: 1.18,
+      scrollback: 10000,
+      allowTransparency: false,
+      theme: {
+        background: "#050505",
+        foreground: "#e7e1ca",
+        cursor: "#f8f3d6",
+        selectionBackground: "#2f5f9f",
+        black: "#101010",
+        red: "#f87171",
+        green: "#86efac",
+        yellow: "#facc15",
+        blue: "#60a5fa",
+        magenta: "#c084fc",
+        cyan: "#67e8f9",
+        white: "#e5e7eb",
+        brightBlack: "#6b7280",
+        brightRed: "#fca5a5",
+        brightGreen: "#bbf7d0",
+        brightYellow: "#fde68a",
+        brightBlue: "#93c5fd",
+        brightMagenta: "#ddd6fe",
+        brightCyan: "#a5f3fc",
+        brightWhite: "#ffffff",
+      },
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(terminalHostRef);
+    terminal.onData((input) => {
+      const sessionId = terminalSessionId();
+      if (!sessionId) {
+        return;
+      }
+      void invokeCommand<void>("write_terminal_session_input", {
+        request: { sessionId, input },
+      }).catch((error) => {
+        setStatus(`Could not send terminal input: ${String(error)}`);
+      });
+    });
+
+    terminalRef = terminal;
+    terminalFitRef = fitAddon;
+    fitTerminal();
+    terminal.focus();
+  }
+
+  async function ensureTerminalSession(cwd: string) {
+    const existingSessionId = terminalSessionId();
+    if (existingSessionId) {
+      return existingSessionId;
+    }
+    if (isTerminalStarting()) {
+      return null;
+    }
+
+    setIsTerminalStarting(true);
+    try {
+      const response = await invokeCommand<TerminalSessionStartResponse>(
+        "start_terminal_session",
         {
           request: {
-            command,
             cwd: cwd || undefined,
           },
         }
       );
-
-      setTerminalEntries((entries) =>
-        [
-          ...entries,
-          {
-            id: makeId(),
-            command: response.command,
-            stdout: truncateUiText(response.stdout, MAX_TERMINAL_OUTPUT_CHARS),
-            stderr: truncateUiText(response.stderr, MAX_TERMINAL_OUTPUT_CHARS),
-            cwd: response.cwd,
-            success: response.success,
-            timestamp: formatTime(),
-          },
-        ].slice(-MAX_TERMINAL_ENTRIES)
-      );
+      setTerminalSessionId(response.sessionId);
       setTerminalCwd(response.cwd || cwd);
-      setTerminalInput("");
-      setStatus(
-        response.success
-          ? "Terminal command finished."
-          : "Terminal command returned a non-zero exit status."
-      );
-    } catch (error) {
-      const message = String(error);
-      setTerminalEntries((entries) =>
-        [
-          ...entries,
-          {
-            id: makeId(),
-            command,
-            stdout: "",
-            stderr: truncateUiText(message, MAX_TERMINAL_OUTPUT_CHARS),
-            cwd,
-            success: false,
-            timestamp: formatTime(),
-          },
-        ].slice(-MAX_TERMINAL_ENTRIES)
-      );
-      setStatus(`Could not run terminal command: ${message}`);
+      setStatus(`Started ${response.shell} terminal session.`);
+      queueMicrotask(fitTerminal);
+      return response.sessionId;
     } finally {
-      setIsRunningTerminal(false);
+      setIsTerminalStarting(false);
     }
+  }
+
+  async function stopTerminalSession() {
+    const sessionId = terminalSessionId();
+    if (!sessionId) {
+      return;
+    }
+
+    await invokeCommand<void>("stop_terminal_session", {
+      request: { sessionId },
+    });
+    setTerminalSessionId(null);
+    setStatus("Stopped terminal session.");
+  }
+
+  function handleTerminalEvent(event: TerminalSessionEvent) {
+    if (event.sessionId !== terminalSessionId()) {
+      return;
+    }
+
+    if (event.kind === "exit") {
+      setTerminalSessionId(null);
+      setIsTerminalStarting(false);
+      setStatus("Terminal session ended.");
+      return;
+    }
+
+    terminalRef?.write(event.data);
   }
 
   function handleCodexEvent(event: CodexFrontendEvent) {
@@ -2585,6 +3125,7 @@ export default function App() {
         break;
       }
       case "approvalRequested": {
+        setUtilityTab("chat");
         const approval: AgentApproval = {
           requestId: event.requestId,
           agentId: "codex",
@@ -2687,6 +3228,7 @@ export default function App() {
         break;
       }
       case "approvalRequested": {
+        setUtilityTab("chat");
         if (!activeGeminiSessionId()) {
           setActiveGeminiSessionId(event.sessionId);
         }
@@ -3040,6 +3582,7 @@ export default function App() {
           currentFile: activeDocument()?.path,
           content: activeDocument()?.content,
           model: selectedAgentModel()?.id || undefined,
+          permissionLevel: selectedAgentPermissionLevel(),
         },
       });
 
@@ -3138,6 +3681,7 @@ export default function App() {
           currentFile: activeDocument()?.path,
           content: activeDocument()?.content,
           model: selectedAgentModel()?.id || undefined,
+          permissionLevel: selectedAgentPermissionLevel(),
         },
       });
 
@@ -3223,6 +3767,7 @@ export default function App() {
           currentFile: activeDocument()?.path,
           content: activeDocument()?.content,
           model: selectedAgentModel()?.id || undefined,
+          permissionLevel: selectedAgentPermissionLevel(),
         },
       });
 
@@ -3567,6 +4112,7 @@ export default function App() {
     const document = activeDocument();
     if (!document) {
       setEditorSemantics(EMPTY_EDITOR_SEMANTICS);
+      setEditorInlayHints([]);
       return;
     }
     const path = document.path;
@@ -3591,6 +4137,41 @@ export default function App() {
         }
       }
     }, document.language === "python" ? 620 : 170);
+
+    onCleanup(() => window.clearTimeout(timeout));
+  });
+
+  createEffect(() => {
+    const document = activeDocument();
+    const root = workspaceRoot();
+    if (!document || document.language !== "python" || !root) {
+      setEditorInlayHints([]);
+      return;
+    }
+
+    const path = document.path;
+    const content = document.content;
+    const timeout = window.setTimeout(async () => {
+      try {
+        const hints = await invokeCommand<EditorInlayHint[]>("request_editor_inlay_hints", {
+          request: {
+            root,
+            filePath: path,
+            source: content,
+            line: 1,
+            column: 1,
+          },
+        });
+
+        if (activeTab() === path) {
+          setEditorInlayHints(hints);
+        }
+      } catch {
+        if (activeTab() === path) {
+          setEditorInlayHints([]);
+        }
+      }
+    }, 720);
 
     onCleanup(() => window.clearTimeout(timeout));
   });
@@ -3650,6 +4231,47 @@ export default function App() {
   });
 
   createEffect(() => {
+    const document = activeDocument();
+    const root = workspaceRoot();
+    const rustStatus = rustEnvironment();
+
+    if (!document || document.language !== "rust" || !root) {
+      return;
+    }
+
+    if (!rustStatus?.cargoTomlExists || !rustStatus.rustAnalyzerAvailable) {
+      setDocuments(document.path, "diagnostics", []);
+      return;
+    }
+
+    const timeout = window.setTimeout(async () => {
+      try {
+        const diagnostics = await invokeCommand<EditorDiagnostic[]>(
+          "analyze_rust_diagnostics",
+          {
+            request: {
+              root,
+              filePath: document.path,
+              source: document.content,
+            },
+          }
+        );
+
+        if (activeTab() === document.path && documents[document.path]) {
+          setDocuments(document.path, "diagnostics", diagnostics);
+        }
+      } catch (error) {
+        if (activeTab() === document.path && documents[document.path]) {
+          setDocuments(document.path, "diagnostics", []);
+          setStatus(`Could not collect rust-analyzer diagnostics: ${String(error)}`);
+        }
+      }
+    }, 1200);
+
+    onCleanup(() => window.clearTimeout(timeout));
+  });
+
+  createEffect(() => {
     chatMessages();
     queueMicrotask(() => {
       chatTimelineRef?.scrollTo({
@@ -3660,12 +4282,19 @@ export default function App() {
   });
 
   createEffect(() => {
-    terminalEntries();
+    const visible = isTerminalVisible();
+    const ready = terminalEventsReady();
+    const root = workspaceRoot() || workspaceInput();
+    terminalHeight();
+
+    if (!visible || !ready) {
+      return;
+    }
+
     queueMicrotask(() => {
-      terminalLogRef?.scrollTo({
-        top: terminalLogRef.scrollHeight,
-        behavior: "smooth",
-      });
+      ensureTerminalRenderer();
+      fitTerminal();
+      void ensureTerminalSession(terminalCwd() || root);
     });
   });
 
@@ -3707,6 +4336,9 @@ export default function App() {
 
     onCleanup(() => {
       disposed = true;
+      terminalRef?.dispose();
+      terminalRef = undefined;
+      terminalFitRef = undefined;
       for (const cleanup of cleanups.splice(0)) {
         cleanup();
       }
@@ -3742,6 +4374,19 @@ export default function App() {
         return;
       }
       cleanups.push(() => void unlistenGemini());
+
+      const unlistenTerminal = await listen<TerminalSessionEvent>(
+        "hematite://terminal",
+        (event) => {
+          handleTerminalEvent(event.payload);
+        }
+      );
+      if (disposed) {
+        unlistenTerminal();
+        return;
+      }
+      cleanups.push(() => void unlistenTerminal());
+      setTerminalEventsReady(true);
 
       try {
         const storedState = await invokeCommand<string | null>("load_ui_state");
@@ -3897,40 +4542,53 @@ export default function App() {
 
       <div ref={gridRef} class="workbench-grid">
         <nav class="activity-bar" aria-label="Primary workbench areas">
-          <button type="button" class="activity-item active" title="Explorer">
-            EX
+          <button type="button" class="activity-item active" title="Explorer" aria-label="Files">
+            <ActivityIcon kind="files" />
           </button>
           <button
             type="button"
             class={`activity-item${utilityTab() === "chat" ? " active" : ""}`}
             title="Agent Workflows"
+            aria-label="Agents"
             onClick={() => setUtilityTab("chat")}
           >
-            AI
+            <ActivityIcon kind="agents" />
           </button>
           <button
             type="button"
             class={`activity-item${utilityTab() === "access" ? " active" : ""}`}
             title="Agent Access"
+            aria-label="Access"
             onClick={() => setUtilityTab("access")}
           >
-            AC
+            <ActivityIcon kind="access" />
+          </button>
+          <button
+            type="button"
+            class={`activity-item${utilityTab() === "share" ? " active" : ""}`}
+            title="CodeShare"
+            aria-label="CodeShare"
+            onClick={() => setUtilityTab("share")}
+          >
+            <ActivityIcon kind="codeshare" />
           </button>
           <button
             type="button"
             class={`activity-item${utilityTab() === "project" ? " active" : ""}`}
             title="Project Automation"
+            aria-label="Project"
             onClick={() => setUtilityTab("project")}
           >
-            PK
+            <ActivityIcon kind="project" />
           </button>
           <button
             type="button"
             class={`activity-item${utilityTab() === "problems" ? " active" : ""}`}
             title="Problems"
+            aria-label="Problems"
             onClick={() => setUtilityTab("problems")}
           >
-            PR
+            <ActivityIcon kind="problems" />
             <Show when={activeDiagnosticStats().total}>
               <span class={`activity-badge ${diagnosticBadgeTone(activeDiagnosticStats())}`}>
                 {activeDiagnosticStats().total}
@@ -3941,17 +4599,19 @@ export default function App() {
             type="button"
             class={`activity-item${utilityTab() === "outline" ? " active" : ""}`}
             title="Outline"
+            aria-label="Outline"
             onClick={() => setUtilityTab("outline")}
           >
-            OL
+            <ActivityIcon kind="outline" />
           </button>
           <button
             type="button"
             class={`activity-item${isTerminalVisible() ? " active" : ""}`}
             title="Terminal"
+            aria-label="Terminal"
             onClick={() => toggleTerminal()}
           >
-            &gt;_
+            <span class="activity-terminal">&gt;_</span>
           </button>
         </nav>
 
@@ -4142,8 +4802,13 @@ export default function App() {
                   path={activeDocument()!.path}
                   diagnostics={activeCodeMirrorDiagnostics()}
                   semanticTokens={editorSemantics().tokens}
+                  inlayHints={editorInlayHints()}
                   lineWrapping={lineWrapping()}
                   onHover={requestEditorHover}
+                  onCompletions={requestEditorCompletions}
+                  onCodeActions={requestEditorCodeActions}
+                  onDefinition={requestEditorDefinition}
+                  onReferences={requestEditorReferences}
                   jumpToLine={jumpToLine()}
                   onChange={(value) => {
                     const path = activeTab();
@@ -4169,6 +4834,9 @@ export default function App() {
               onClick={() => setUtilityTab("chat")}
             >
               Agents
+              <Show when={pendingApprovalCount()}>
+                <span class="utility-tab-badge warning">{pendingApprovalCount()}</span>
+              </Show>
             </button>
             <button
               type="button"
@@ -4176,6 +4844,13 @@ export default function App() {
               onClick={() => setUtilityTab("access")}
             >
               Access
+            </button>
+            <button
+              type="button"
+              class={`utility-tab${utilityTab() === "share" ? " active" : ""}`}
+              onClick={() => setUtilityTab("share")}
+            >
+              CodeShare
             </button>
             <button
               type="button"
@@ -4272,6 +4947,33 @@ export default function App() {
                               </select>
                             </label>
                           </Show>
+
+                          <label class="model-select-field card-model-select">
+                            <span>Run access</span>
+                            <select
+                              value={
+                                selectedAgentPermissionLevels[agent.id] ??
+                                defaultAgentPermissionLevel(agent)
+                              }
+                              onChange={(event) => {
+                                const value = event.currentTarget.value;
+                                if (isAgentPermissionLevel(value)) {
+                                  setSelectedAgentPermissionLevels(agent.id, value);
+                                }
+                              }}
+                            >
+                              <For each={AGENT_PERMISSION_OPTIONS}>
+                                {(option) => <option value={option.id}>{option.label}</option>}
+                              </For>
+                            </select>
+                          </label>
+                          <div class="agent-card-copy">
+                            {agentPermissionNote(
+                              agent,
+                              selectedAgentPermissionLevels[agent.id] ??
+                                defaultAgentPermissionLevel(agent)
+                            )}
+                          </div>
 
                           <div class="agent-card-actions">
                             <button
@@ -4445,6 +5147,191 @@ export default function App() {
               </section>
             </Show>
 
+            <Show when={utilityTab() === "share"}>
+              <section class="panel-section no-divider">
+                <div class="pane-header compact">
+                  <div>
+                    <div class="pane-title">CodeShare</div>
+                    <div class="pane-caption">Local collaboration sessions for shared work</div>
+                  </div>
+                  <button
+                    type="button"
+                    class="pane-button"
+                    disabled={!codeShareSession()}
+                    onClick={() => void copyCodeShareInvite()}
+                  >
+                    Copy invite
+                  </button>
+                </div>
+
+                <article class="status-card share-card">
+                  <label class="form-field">
+                    <span>Session name</span>
+                    <input
+                      value={shareTitle()}
+                      onInput={(event) => setShareTitle(event.currentTarget.value)}
+                    />
+                  </label>
+
+                  <div class="codeshare-grid">
+                    <div class="status-row">
+                      <span>Workspace</span>
+                      <strong>{basename(workspaceRoot()) || "No workspace"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Active file</span>
+                      <strong>{activeDocument()?.name ?? "No file"}</strong>
+                    </div>
+                    <div class="status-row">
+                      <span>Agent control</span>
+                      <strong>
+                        {selectedAgent().label} · {selectedAgentPermissionOption().label}
+                      </strong>
+                    </div>
+                  </div>
+
+                  <div class="share-action-row">
+                    <button
+                      type="button"
+                      class="command-button accent"
+                      disabled={isStartingCodeShare()}
+                      onClick={() => void startCodeShareSession()}
+                    >
+                      {isStartingCodeShare() ? "Starting..." : "Start session"}
+                    </button>
+                    <button
+                      type="button"
+                      class="command-button"
+                      disabled={!codeShareSession()}
+                      onClick={() => void copyCodeShareInvite()}
+                    >
+                      Copy invite
+                    </button>
+                  </div>
+
+                  <Show when={shareStatus()}>
+                    <div class="pane-note inline-note">{shareStatus()}</div>
+                  </Show>
+                </article>
+
+                <article class="status-card share-card">
+                  <div class="status-card-head">
+                    <div>
+                      <div class="status-card-title">Join session</div>
+                      <div class="status-card-copy">
+                        Paste a CodeShare code or `hematite://codeshare/...` invite.
+                      </div>
+                    </div>
+                  </div>
+
+                  <div class="inline-input-row">
+                    <label class="form-field">
+                      <span>Invite</span>
+                      <input
+                        value={codeShareJoinCode()}
+                        placeholder="CS-..."
+                        spellcheck={false}
+                        onInput={(event) => setCodeShareJoinCode(event.currentTarget.value)}
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      class="command-button"
+                      disabled={isJoiningCodeShare()}
+                      onClick={() => void joinCodeShareSession()}
+                    >
+                      {isJoiningCodeShare() ? "Joining..." : "Join"}
+                    </button>
+                  </div>
+                </article>
+
+                <article class="status-card">
+                  <div class="status-card-head">
+                    <div>
+                      <div class="status-card-title">Session status</div>
+                      <div class="status-card-copy">
+                        <Show when={codeShareSession()} fallback="No active CodeShare session">
+                          {(session) => `${session().status} · ${session().inviteCode}`}
+                        </Show>
+                      </div>
+                    </div>
+                    <span class={`state-badge ${codeShareSession() ? "ready" : "muted"}`}>
+                      {codeShareSession()?.participantCount ?? 0} connected
+                    </span>
+                  </div>
+
+                  <Show
+                    when={codeShareSession()}
+                    fallback={
+                      <div class="empty-note">
+                        Start a session to create an invite code for this workspace.
+                      </div>
+                    }
+                  >
+                    {(session) => (
+                      <div class="codeshare-grid">
+                        <div class="status-row">
+                          <span>Invite code</span>
+                          <strong>{session().inviteCode}</strong>
+                        </div>
+                        <div class="status-row">
+                          <span>Invite link</span>
+                          <strong>{session().inviteLink}</strong>
+                        </div>
+                        <div class="status-row">
+                          <span>Shared file</span>
+                          <strong>{session().activeFile ?? "Workspace only"}</strong>
+                        </div>
+                      </div>
+                    )}
+                  </Show>
+                </article>
+
+                <details class="settings-disclosure">
+                  <summary>Handoff context</summary>
+                  <div class="settings-disclosure-body">
+                    <div class="share-option-list">
+                      <label class="check-row">
+                        <input
+                          type="checkbox"
+                          checked={shareIncludeRecentChat()}
+                          onChange={(event) =>
+                            setShareIncludeRecentChat(event.currentTarget.checked)
+                          }
+                        />
+                        <span>Recent conversation</span>
+                      </label>
+                      <label class="check-row">
+                        <input
+                          type="checkbox"
+                          checked={shareIncludeContext()}
+                          onChange={(event) => setShareIncludeContext(event.currentTarget.checked)}
+                        />
+                        <span>Compact context</span>
+                      </label>
+                    </div>
+                    <div class="share-action-row">
+                      <button
+                        type="button"
+                        class="command-button"
+                        onClick={() => void copyTaskShareDraft()}
+                      >
+                        Copy handoff
+                      </button>
+                      <button
+                        type="button"
+                        class="command-button"
+                        onClick={() => queueTaskShareDraftForAgent()}
+                      >
+                        Queue in chat
+                      </button>
+                    </div>
+                    <pre class="terminal-output context share-preview">{taskShareDraft()}</pre>
+                  </div>
+                </details>
+              </section>
+            </Show>
+
             <Show when={utilityTab() === "chat"}>
               <div class="chat-shell">
                 <div class="chat-toolbar">
@@ -4492,8 +5379,8 @@ export default function App() {
                   </For>
                 </div>
 
-                <Show when={selectedAgent().models?.length}>
-                  <div class="agent-model-bar">
+                <div class="agent-run-controls">
+                  <Show when={selectedAgent().models?.length}>
                     <label class="model-select-field prominent">
                       <span>Model</span>
                       <select
@@ -4510,8 +5397,27 @@ export default function App() {
                         </For>
                       </select>
                     </label>
+                  </Show>
+                  <label class="model-select-field prominent">
+                    <span>Run access</span>
+                    <select
+                      value={selectedAgentPermissionLevel()}
+                      onChange={(event) => {
+                        const value = event.currentTarget.value;
+                        if (isAgentPermissionLevel(value)) {
+                          setSelectedAgentPermissionLevels(selectedAgent().id, value);
+                        }
+                      }}
+                    >
+                      <For each={AGENT_PERMISSION_OPTIONS}>
+                        {(option) => <option value={option.id}>{option.label}</option>}
+                      </For>
+                    </select>
+                  </label>
+                  <div class="permission-note">
+                    {agentPermissionNote(selectedAgent(), selectedAgentPermissionLevel())}
                   </div>
-                </Show>
+                </div>
 
                 <section class="agent-session-panel">
                   <div class="agent-session-toolbar">
@@ -4825,6 +5731,42 @@ export default function App() {
                     </For>
                   </div>
 
+                  <Show when={latestPendingApproval()}>
+                    {(approvalAccessor) => {
+                      const approval = approvalAccessor();
+
+                      return (
+                        <div class="pending-approval-bar">
+                          <div class="pending-approval-copy">
+                            <span class="approval-kind">{approvalTitle(approval)}</span>
+                            <span class="approval-copy subtle">
+                              {approval.reason || approval.command || "Agent response required"}
+                            </span>
+                          </div>
+                          <div class="approval-actions compact">
+                            <For each={approval.choices}>
+                              {(choice) => (
+                                <button
+                                  type="button"
+                                  class={`command-button${
+                                    choice.id.includes("deny") ||
+                                    choice.id.includes("reject") ||
+                                    choice.id.includes("cancel")
+                                      ? ""
+                                      : " accent"
+                                  }`}
+                                  onClick={() => void respondToApproval(approval, choice.id)}
+                                >
+                                  {choice.label}
+                                </button>
+                              )}
+                            </For>
+                          </div>
+                        </div>
+                      );
+                    }}
+                  </Show>
+
                   <div class="quick-prompts">
                     <For each={QUICK_PROMPTS}>
                       {(prompt) => (
@@ -5125,7 +6067,7 @@ export default function App() {
                     </div>
                     <div class="status-row">
                       <span>Diagnostics</span>
-                      <strong>Cargo JSON diagnostics on explicit runs</strong>
+                      <strong>rust-analyzer active-file diagnostics</strong>
                     </div>
                     <div class="status-row">
                       <span>Debug</span>
@@ -5580,10 +6522,19 @@ export default function App() {
               <button
                 type="button"
                 class="pane-button"
-                disabled={!terminalEntries().length}
+                disabled={!terminalSessionId()}
+                onClick={() => void stopTerminalSession()}
+              >
+                Stop
+              </button>
+              <button
+                type="button"
+                class="pane-button"
+                disabled={isTerminalStarting()}
                 onClick={() => {
-                  setTerminalEntries([]);
-                  setStatus("Cleared terminal output.");
+                  terminalRef?.clear();
+                  terminalRef?.focus();
+                  setStatus("Cleared terminal scrollback.");
                 }}
               >
                 Clear
@@ -5592,72 +6543,11 @@ export default function App() {
           </div>
 
           <div class="terminal-panel-body">
-            <div ref={terminalLogRef} class="terminal-log">
-              <Show
-                when={terminalEntries().length}
-                fallback={
-                  <div class="terminal-empty">
-                    Run PowerShell commands inside Hematite. The working directory
-                    stays in sync between commands, so <code>cd</code>,{" "}
-                    <code>uv sync</code>, and agent CLIs can all stay in-app.
-                  </div>
-                }
-              >
-                <For each={terminalEntries()}>
-                  {(entry) => (
-                    <article class={`terminal-entry${entry.success ? "" : " error"}`}>
-                      <div class="terminal-entry-meta">
-                        <span>{entry.timestamp}</span>
-                        <span class="text-wrap">{entry.cwd}</span>
-                      </div>
-
-                      <div class="terminal-command-line">
-                        <span class="terminal-command-prefix">$</span>
-                        <span>{entry.command}</span>
-                      </div>
-
-                      <Show when={entry.stdout}>
-                        <pre class="terminal-output terminal-log-output">{entry.stdout}</pre>
-                      </Show>
-
-                      <Show when={entry.stderr}>
-                        <pre class="terminal-output terminal-log-output error">
-                          {entry.stderr}
-                        </pre>
-                      </Show>
-                    </article>
-                  )}
-                </For>
-              </Show>
-            </div>
-
-            <form
-              class="terminal-input-row"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void runTerminalCommand();
-              }}
-            >
-              <label class="terminal-input-shell">
-                <span class="terminal-prompt">
-                  PS {basename(terminalCwd() || workspaceRoot() || "~")}
-                </span>
-                <input
-                  value={terminalInput()}
-                  placeholder="Run a PowerShell command in this workspace"
-                  spellcheck={false}
-                  onInput={(event) => setTerminalInput(event.currentTarget.value)}
-                />
-              </label>
-
-              <button
-                type="submit"
-                class="command-button accent"
-                disabled={isRunningTerminal()}
-              >
-                {isRunningTerminal() ? "Running..." : "Run"}
-              </button>
-            </form>
+            <div
+              ref={terminalHostRef}
+              class="terminal-emulator"
+              onClick={() => terminalRef?.focus()}
+            />
           </div>
         </section>
       </Show>

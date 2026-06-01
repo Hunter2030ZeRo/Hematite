@@ -1,6 +1,7 @@
+use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
 use std::{
@@ -10,15 +11,16 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Output, Stdio},
     sync::{
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        mpsc,
     },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tauri::{
+    AppHandle, Emitter, Manager,
     menu::{AboutMetadata, Menu, MenuItem, PredefinedMenuItem, Submenu},
-    Emitter, Manager,
 };
 use tree_sitter::{Node, Parser};
 use walkdir::WalkDir;
@@ -31,6 +33,7 @@ const MAX_AUTOMATIC_RUST_ANALYSIS_BYTES: usize = 192 * 1024;
 const MAX_AUTOMATIC_C_FAMILY_ANALYSIS_BYTES: usize = 192 * 1024;
 const RUST_ANALYZER_HOVER_RETRY_DELAYS_MS: &[u64] = &[80, 160, 320, 640];
 const TERMINAL_CWD_MARKER: &str = "__HEMATITE_CWD__=";
+const TERMINAL_STATUS_MARKER: &str = "__HEMATITE_STATUS__=";
 const PYTHON_INSTALL_FAILURE_COOLDOWN: Duration = Duration::from_secs(45);
 const UI_STATE_FILE_NAME: &str = "ui-state.json";
 const LEGACY_UI_STATE_IDENTIFIERS: &[&str] = &["com.entity_27th.hematite"];
@@ -50,11 +53,15 @@ static PYTHON_INSTALL_IN_PROGRESS: OnceLock<Mutex<BTreeSet<String>>> = OnceLock:
 static CODEX_APP_SERVER: OnceLock<Mutex<CodexAppServerState>> = OnceLock::new();
 static CODEX_MODEL_OVERRIDE: OnceLock<Option<String>> = OnceLock::new();
 static GEMINI_ACP: OnceLock<Mutex<GeminiAcpState>> = OnceLock::new();
+static CODESHARE_STATE: OnceLock<Mutex<CodeShareState>> = OnceLock::new();
 static TY_LSP: OnceLock<Mutex<TyLspState>> = OnceLock::new();
 static RUST_ANALYZER_LSP: OnceLock<Mutex<RustAnalyzerLspState>> = OnceLock::new();
 static AGENT_SESSIONS: OnceLock<AgentSessionRegistry> = OnceLock::new();
+static TERMINAL_SESSIONS: OnceLock<TerminalSessionRegistry> = OnceLock::new();
 
 const PYTHON_MISSING_IMPORT_PREFIX: &str = "import:";
+const TERMINAL_PTY_COLS: u16 = 120;
+const TERMINAL_PTY_ROWS: u16 = 30;
 const LSP_SEMANTIC_TOKEN_TYPES: &[&str] = &[
     "namespace",
     "type",
@@ -407,6 +414,7 @@ struct AgentRunRequest {
     current_file: Option<String>,
     content: Option<String>,
     model: Option<String>,
+    permission_level: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -498,6 +506,18 @@ struct AgentSessionRegistry {
     next_session_id: AtomicUsize,
 }
 
+struct TerminalSession {
+    master: Box<dyn MasterPty + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    child: Arc<Mutex<Box<dyn portable_pty::Child + Send + Sync>>>,
+}
+
+#[derive(Default)]
+struct TerminalSessionRegistry {
+    sessions: Mutex<BTreeMap<String, TerminalSession>>,
+    next_session_id: AtomicUsize,
+}
+
 fn language_id(language: SourceLanguage) -> &'static str {
     match language {
         SourceLanguage::Python => "python",
@@ -566,8 +586,11 @@ fn language_capability_status_for_tool(
     let resolved_path_string = resolved_path
         .as_ref()
         .map(|path| path.to_string_lossy().to_string());
-    let supported_features =
-        features_for_language_provider(language, provider_name, project_ready && resolved_path.is_some());
+    let supported_features = features_for_language_provider(
+        language,
+        provider_name,
+        project_ready && resolved_path.is_some(),
+    );
 
     let availability = if resolved_path.is_none() {
         LanguageProviderAvailability::Missing
@@ -589,9 +612,10 @@ fn language_capability_status_for_tool(
 
     let recommended_action = match availability {
         LanguageProviderAvailability::Missing => Some(missing_tool_action(provider_name)),
-        LanguageProviderAvailability::Degraded => {
-            Some("Open a configured project or add the metadata this language server expects.".to_string())
-        }
+        LanguageProviderAvailability::Degraded => Some(
+            "Open a configured project or add the metadata this language server expects."
+                .to_string(),
+        ),
         LanguageProviderAvailability::Active | LanguageProviderAvailability::Unsupported => None,
     };
 
@@ -807,6 +831,10 @@ fn agent_sessions() -> &'static AgentSessionRegistry {
     AGENT_SESSIONS.get_or_init(AgentSessionRegistry::default)
 }
 
+fn terminal_sessions() -> &'static TerminalSessionRegistry {
+    TERMINAL_SESSIONS.get_or_init(TerminalSessionRegistry::default)
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PythonImportRequest {
@@ -867,6 +895,14 @@ struct RustToolingRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct RustDiagnosticsRequest {
+    root: String,
+    file_path: String,
+    source: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct EditorHoverRequest {
     root: String,
     file_path: String,
@@ -885,6 +921,45 @@ struct EditorDiagnostic {
     column: u32,
     severity: String,
     message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorCompletionItem {
+    label: String,
+    detail: Option<String>,
+    kind: String,
+    insert_text: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorCodeAction {
+    title: String,
+    kind: Option<String>,
+    edit: Option<Value>,
+    command: Option<Value>,
+    is_preferred: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorLocation {
+    uri: String,
+    path: Option<String>,
+    line: u32,
+    column: u32,
+    end_line: u32,
+    end_column: u32,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorInlayHint {
+    label: String,
+    line: u32,
+    column: u32,
+    kind: String,
 }
 
 #[derive(Serialize)]
@@ -1054,6 +1129,96 @@ struct TerminalCommandResponse {
     cwd: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionStartRequest {
+    cwd: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionStartResponse {
+    session_id: String,
+    cwd: String,
+    shell: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionInputRequest {
+    session_id: String,
+    input: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionCommandRequest {
+    session_id: String,
+    command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionStopRequest {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionResizeRequest {
+    session_id: String,
+    rows: u16,
+    cols: u16,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TerminalSessionEvent {
+    session_id: String,
+    kind: String,
+    data: String,
+    success: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeShareSession {
+    session_id: String,
+    invite_code: String,
+    invite_link: String,
+    title: String,
+    root: String,
+    active_file: Option<String>,
+    agent_label: String,
+    permission_level: String,
+    status: String,
+    participant_count: u32,
+    created_at: u64,
+    updated_at: u64,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeShareSessionRequest {
+    title: String,
+    root: String,
+    active_file: Option<String>,
+    agent_label: String,
+    permission_level: String,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodeShareJoinRequest {
+    invite_code: String,
+}
+
+#[derive(Default)]
+struct CodeShareState {
+    next_session_id: u64,
+    sessions_by_invite: BTreeMap<String, CodeShareSession>,
+}
+
 struct PreparedCommand {
     command: Command,
     preview: Vec<String>,
@@ -1115,6 +1280,7 @@ struct CodexSharedState {
     current_root: String,
     current_thread_id: Option<String>,
     current_thread_model: Option<String>,
+    current_thread_permission_level: Option<AgentPermissionLevel>,
     active_turn_id: Option<String>,
     last_stderr: Option<String>,
     pending_responses: BTreeMap<String, mpsc::Sender<Result<Value, String>>>,
@@ -1129,6 +1295,7 @@ impl CodexSharedState {
             current_root: root,
             current_thread_id: None,
             current_thread_model: None,
+            current_thread_permission_level: None,
             active_turn_id: None,
             last_stderr: None,
             pending_responses: BTreeMap::new(),
@@ -1148,6 +1315,7 @@ struct GeminiSharedState {
     initialized: bool,
     current_root: String,
     current_model: Option<String>,
+    current_permission_level: AgentPermissionLevel,
     current_session_id: Option<String>,
     prompt_in_progress: bool,
     pending_responses: BTreeMap<String, mpsc::Sender<Result<Value, String>>>,
@@ -1155,12 +1323,13 @@ struct GeminiSharedState {
 }
 
 impl GeminiSharedState {
-    fn new(root: String, model: Option<String>) -> Self {
+    fn new(root: String, model: Option<String>, permission_level: AgentPermissionLevel) -> Self {
         Self {
             next_request_id: 1,
             initialized: false,
             current_root: root,
             current_model: model,
+            current_permission_level: permission_level,
             current_session_id: None,
             prompt_in_progress: false,
             pending_responses: BTreeMap::new(),
@@ -1215,7 +1384,14 @@ struct RustAnalyzerLspSharedState {
     current_root: String,
     token_types: Vec<String>,
     synced_documents: BTreeMap<String, i32>,
+    published_diagnostics: BTreeMap<String, RustAnalyzerPublishedDiagnostics>,
     pending_responses: BTreeMap<String, mpsc::Sender<Result<Value, String>>>,
+}
+
+#[derive(Clone)]
+struct RustAnalyzerPublishedDiagnostics {
+    version: Option<i32>,
+    diagnostics: Vec<Value>,
 }
 
 impl RustAnalyzerLspSharedState {
@@ -1230,6 +1406,7 @@ impl RustAnalyzerLspSharedState {
                 .map(|value| value.to_string())
                 .collect(),
             synced_documents: BTreeMap::new(),
+            published_diagnostics: BTreeMap::new(),
             pending_responses: BTreeMap::new(),
         }
     }
@@ -1250,6 +1427,7 @@ struct CodexTurnRequest {
     current_file: Option<String>,
     content: Option<String>,
     model: Option<String>,
+    permission_level: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1342,6 +1520,7 @@ struct GeminiTurnRequest {
     current_file: Option<String>,
     content: Option<String>,
     model: Option<String>,
+    permission_level: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1668,6 +1847,76 @@ async fn request_editor_hover(request: EditorHoverRequest) -> Result<Option<Hove
             "cpp" => Ok(request_c_family_hover(&request, SourceLanguage::Cpp)),
             "cuda-cpp" => Ok(request_c_family_hover(&request, SourceLanguage::Cuda)),
             _ => Ok(None),
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn request_editor_completions(
+    request: EditorHoverRequest,
+) -> Result<Vec<EditorCompletionItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match language_id_from_path(Path::new(&request.file_path)) {
+            "python" => request_ty_completions(&request),
+            _ => Ok(Vec::new()),
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn request_editor_code_actions(
+    request: EditorHoverRequest,
+) -> Result<Vec<EditorCodeAction>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match language_id_from_path(Path::new(&request.file_path)) {
+            "python" => request_ty_code_actions(&request),
+            _ => Ok(Vec::new()),
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn request_editor_definition(
+    request: EditorHoverRequest,
+) -> Result<Option<EditorLocation>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match language_id_from_path(Path::new(&request.file_path)) {
+            "python" => request_ty_definition(&request),
+            _ => Ok(None),
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn request_editor_references(
+    request: EditorHoverRequest,
+) -> Result<Vec<EditorLocation>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match language_id_from_path(Path::new(&request.file_path)) {
+            "python" => request_ty_references(&request),
+            _ => Ok(Vec::new()),
+        }
+    })
+    .await
+    .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn request_editor_inlay_hints(
+    request: EditorHoverRequest,
+) -> Result<Vec<EditorInlayHint>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        match language_id_from_path(Path::new(&request.file_path)) {
+            "python" => request_ty_inlay_hints(&request),
+            _ => Ok(Vec::new()),
         }
     })
     .await
@@ -2009,9 +2258,9 @@ fn inspect_rust_environment_sync(root: &str) -> Result<RustEnvironmentStatus, St
     let codelldb_available = probe_command("codelldb").is_some();
 
     let summary = if !cargo_toml_exists {
-        "No Cargo.toml was found at this workspace root. Hematite will use the standalone Rust parser for hover and semantic coloring; open a Cargo package or workspace to enable rust-analyzer, Cargo checks, Clippy, tests, docs, and metadata.".to_string()
+        "No Cargo.toml was found at this workspace root. Hematite will use the standalone Rust parser for hover and semantic coloring; open a Cargo package or workspace to enable rust-analyzer diagnostics, Cargo checks, Clippy, tests, docs, and metadata.".to_string()
     } else if rust_analyzer_available && rustfmt_available && clippy_available {
-        "Cargo, rust-analyzer, rustfmt, and Clippy are available. Hematite can provide Rust hover, semantic tokens, formatting, linting, builds, tests, docs, and metadata.".to_string()
+        "Cargo, rust-analyzer, rustfmt, and Clippy are available. Hematite can provide Rust hover, semantic tokens, diagnostics, formatting, linting, builds, tests, docs, and metadata.".to_string()
     } else if rust_analyzer_available {
         "Cargo project found with rust-analyzer available. Install rustfmt and Clippy components for the full Rust IDE workflow.".to_string()
     } else {
@@ -2047,7 +2296,15 @@ fn inspect_rust_environment_sync(root: &str) -> Result<RustEnvironmentStatus, St
 }
 
 #[tauri::command]
-fn execute_terminal_command(
+async fn execute_terminal_command(
+    request: TerminalCommandRequest,
+) -> Result<TerminalCommandResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || execute_terminal_command_blocking(request))
+        .await
+        .map_err(|err| err.to_string())?
+}
+
+fn execute_terminal_command_blocking(
     request: TerminalCommandRequest,
 ) -> Result<TerminalCommandResponse, String> {
     let command_text = request.command.trim();
@@ -2064,64 +2321,216 @@ fn execute_terminal_command(
 
     let resolved_cwd = fs::canonicalize(&requested_cwd).unwrap_or(requested_cwd);
     let stored = load_agent_credentials();
-
-    #[cfg(target_os = "windows")]
-    let mut command = {
-        let inline = format!(
-            "$ErrorActionPreference = 'Continue'; \
-             try {{ Set-Location -LiteralPath {cwd}; }} catch {{ Write-Error $_; Write-Output ('{marker}' + {cwd}); exit 1 }}; \
-             $global:LASTEXITCODE = $null; \
-             try {{ Invoke-Expression {input}; }} catch {{ Write-Error $_; }}; \
-             $exitCode = if (($LASTEXITCODE -as [int]) -ne $null) {{ [int]$LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }}; \
-             Write-Output ('{marker}' + (Get-Location).Path); \
-             exit $exitCode",
-            cwd = powershell_quote(&path_to_string(&resolved_cwd)),
-            input = powershell_quote(command_text),
-            marker = TERMINAL_CWD_MARKER,
-        );
-
-        let mut command = Command::new("powershell.exe");
-        command.args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            &inline,
-        ]);
-        hide_background_window(&mut command);
-        command
-    };
-
-    #[cfg(not(target_os = "windows"))]
-    let mut command = {
-        let inline = format!(
-            "cd {cwd} && {{ {input}; }}; status=$?; printf '%s%s\\n' '{marker}' \"$PWD\"; exit $status",
-            cwd = shell_quote(&path_to_string(&resolved_cwd)),
-            input = command_text,
-            marker = TERMINAL_CWD_MARKER,
-        );
-
-        let mut command = Command::new("sh");
-        command.args(["-lc", &inline]);
-        command
-    };
-
-    command.current_dir(&resolved_cwd);
-    apply_agent_env(&mut command, &stored);
-    apply_workspace_env(&mut command, &resolved_cwd);
-    hide_background_window(&mut command);
-
-    let output = command.output().map_err(|err| err.to_string())?;
-    let (stdout, cwd) =
-        split_terminal_output(&String::from_utf8_lossy(&output.stdout), &resolved_cwd);
+    let (success, raw_output) = run_terminal_command_in_pty(command_text, &resolved_cwd, &stored)?;
+    let cleaned_output = strip_terminal_control_sequences(&raw_output);
+    let (stdout, cwd) = split_terminal_output(&cleaned_output, &resolved_cwd);
 
     Ok(TerminalCommandResponse {
-        success: output.status.success(),
+        success,
         command: command_text.to_string(),
         stdout,
-        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        stderr: String::new(),
         cwd,
     })
+}
+
+#[tauri::command]
+fn start_terminal_session(
+    app: AppHandle,
+    request: TerminalSessionStartRequest,
+) -> Result<TerminalSessionStartResponse, String> {
+    let requested_cwd = request
+        .cwd
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(detect_workspace_root().unwrap_or_else(|_| ".".into())));
+    let resolved_cwd = fs::canonicalize(&requested_cwd).unwrap_or(requested_cwd);
+    let stored = load_agent_credentials();
+
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: TERMINAL_PTY_ROWS,
+            cols: TERMINAL_PTY_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|err| format!("Could not open terminal PTY. {err}"))?;
+
+    let (mut command, shell) = terminal_session_shell_command(&resolved_cwd);
+    apply_agent_env_to_pty(&mut command, &stored);
+    apply_workspace_env_to_pty(&mut command, &resolved_cwd);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|err| format!("Could not read from terminal PTY. {err}"))?;
+    let writer = pair
+        .master
+        .take_writer()
+        .map_err(|err| format!("Could not write to terminal PTY. {err}"))?;
+    let child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|err| format!("Could not start terminal shell. {err}"))?;
+    drop(pair.slave);
+
+    let registry = terminal_sessions();
+    let session_number = registry.next_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+    let session_id = format!("terminal-{session_number}");
+    let child = Arc::new(Mutex::new(child));
+    let writer = Arc::new(Mutex::new(writer));
+
+    {
+        let mut sessions = registry
+            .sessions
+            .lock()
+            .map_err(|_| "Terminal session registry lock was poisoned.".to_string())?;
+        sessions.insert(
+            session_id.clone(),
+            TerminalSession {
+                master: pair.master,
+                writer: Arc::clone(&writer),
+                child: Arc::clone(&child),
+            },
+        );
+    }
+
+    let output_app = app.clone();
+    let output_session_id = session_id.clone();
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(len) => {
+                    let data = String::from_utf8_lossy(&buffer[..len]).to_string();
+                    let _ = output_app.emit(
+                        "hematite://terminal",
+                        TerminalSessionEvent {
+                            session_id: output_session_id.clone(),
+                            kind: "output".into(),
+                            data,
+                            success: None,
+                        },
+                    );
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let exit_app = app;
+    let exit_session_id = session_id.clone();
+    thread::spawn(move || {
+        loop {
+            let success = match child.lock() {
+                Ok(mut child) => match child.try_wait() {
+                    Ok(status) => status.map(|status| status.success()),
+                    Err(_) => Some(false),
+                },
+                Err(_) => Some(false),
+            };
+
+            if let Some(success) = success {
+                let _ = terminal_sessions()
+                    .sessions
+                    .lock()
+                    .map(|mut sessions| sessions.remove(&exit_session_id));
+                let _ = exit_app.emit(
+                    "hematite://terminal",
+                    TerminalSessionEvent {
+                        session_id: exit_session_id,
+                        kind: "exit".into(),
+                        data: String::new(),
+                        success: Some(success),
+                    },
+                );
+                break;
+            }
+
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+
+    Ok(TerminalSessionStartResponse {
+        session_id,
+        cwd: path_to_string(&resolved_cwd),
+        shell: shell.into(),
+    })
+}
+
+#[tauri::command]
+fn write_terminal_session_input(request: TerminalSessionInputRequest) -> Result<(), String> {
+    write_to_terminal_session(&request.session_id, &request.input)
+}
+
+#[tauri::command]
+fn write_terminal_session_command(request: TerminalSessionCommandRequest) -> Result<(), String> {
+    let command_text = request.command.trim();
+    if command_text.is_empty() {
+        return Err("Terminal command cannot be empty.".into());
+    }
+    write_to_terminal_session(
+        &request.session_id,
+        &terminal_session_command_input(command_text),
+    )
+}
+
+#[tauri::command]
+fn stop_terminal_session(request: TerminalSessionStopRequest) -> Result<(), String> {
+    let session = terminal_sessions()
+        .sessions
+        .lock()
+        .map_err(|_| "Terminal session registry lock was poisoned.".to_string())?
+        .remove(&request.session_id);
+
+    if let Some(session) = session {
+        let _ = session.child.lock().map(|mut child| child.kill());
+    }
+
+    Ok(())
+}
+
+#[tauri::command]
+fn resize_terminal_session(request: TerminalSessionResizeRequest) -> Result<(), String> {
+    let sessions = terminal_sessions()
+        .sessions
+        .lock()
+        .map_err(|_| "Terminal session registry lock was poisoned.".to_string())?;
+    let session = sessions
+        .get(&request.session_id)
+        .ok_or_else(|| "Terminal session is no longer active.".to_string())?;
+    session
+        .master
+        .resize(PtySize {
+            rows: request.rows.max(1),
+            cols: request.cols.max(1),
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|err| format!("Could not resize terminal PTY. {err}"))
+}
+
+#[tauri::command]
+fn start_codeshare_session(request: CodeShareSessionRequest) -> Result<CodeShareSession, String> {
+    let mut state = codeshare_state()
+        .lock()
+        .map_err(|_| "CodeShare state lock was poisoned.".to_string())?;
+    Ok(start_codeshare_session_in_state(
+        &mut state,
+        request,
+        unix_timestamp_seconds(),
+    ))
+}
+
+#[tauri::command]
+fn join_codeshare_session(request: CodeShareJoinRequest) -> Result<CodeShareSession, String> {
+    let mut state = codeshare_state()
+        .lock()
+        .map_err(|_| "CodeShare state lock was poisoned.".to_string())?;
+    join_codeshare_session_in_state(&mut state, request, unix_timestamp_seconds())
 }
 
 #[tauri::command]
@@ -2155,8 +2564,12 @@ fn run_agent_blocking(request: AgentRunRequest) -> Result<AgentRunResponse, Stri
         request.prompt.trim().to_string()
     };
 
-    let model_args =
-        agent_args_with_selected_model(&request.binary, &request.args, request.model.as_deref());
+    let model_args = agent_args_with_selected_model(
+        &request.binary,
+        &request.args,
+        request.model.as_deref(),
+        request.permission_level.as_deref(),
+    );
     let resolved_args = model_args
         .iter()
         .map(|value| value.replace("{prompt}", &prompt))
@@ -2212,6 +2625,99 @@ fn run_agent_blocking(request: AgentRunRequest) -> Result<AgentRunResponse, Stri
     })
 }
 
+fn codeshare_state() -> &'static Mutex<CodeShareState> {
+    CODESHARE_STATE.get_or_init(|| Mutex::new(CodeShareState::default()))
+}
+
+fn unix_timestamp_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn start_codeshare_session_in_state(
+    state: &mut CodeShareState,
+    request: CodeShareSessionRequest,
+    now: u64,
+) -> CodeShareSession {
+    state.next_session_id = state.next_session_id.saturating_add(1);
+    let sequence = state.next_session_id;
+    let invite_code = format!("CS-{now:X}-{sequence:04X}");
+    let session_id = format!("codeshare-{now:x}-{sequence:x}");
+    let session = CodeShareSession {
+        session_id,
+        invite_link: format!("hematite://codeshare/{invite_code}"),
+        invite_code: invite_code.clone(),
+        title: normalize_codeshare_title(&request.title),
+        root: request.root.trim().to_string(),
+        active_file: request
+            .active_file
+            .and_then(|value| normalize_optional_codeshare_value(&value)),
+        agent_label: normalize_codeshare_label(&request.agent_label, "Agent"),
+        permission_level: normalize_codeshare_label(&request.permission_level, "ask"),
+        status: "hosting".into(),
+        participant_count: 1,
+        created_at: now,
+        updated_at: now,
+    };
+
+    state
+        .sessions_by_invite
+        .insert(invite_code, session.clone());
+    session
+}
+
+fn join_codeshare_session_in_state(
+    state: &mut CodeShareState,
+    request: CodeShareJoinRequest,
+    now: u64,
+) -> Result<CodeShareSession, String> {
+    let invite_code = normalize_codeshare_invite_code(&request.invite_code);
+    let session = state
+        .sessions_by_invite
+        .get_mut(&invite_code)
+        .ok_or_else(|| "CodeShare invite was not found.".to_string())?;
+
+    session.participant_count = session.participant_count.saturating_add(1);
+    session.updated_at = now;
+
+    let mut joined = session.clone();
+    joined.status = "joined".into();
+    Ok(joined)
+}
+
+fn normalize_codeshare_title(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        "CodeShare session".into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_codeshare_label(value: &str, fallback: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        fallback.into()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_optional_codeshare_value(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn normalize_codeshare_invite_code(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches("hematite://codeshare/")
+        .trim_end_matches('/')
+        .to_ascii_uppercase()
+}
+
 #[tauri::command]
 fn start_codex_turn(
     app: tauri::AppHandle,
@@ -2251,11 +2757,21 @@ fn start_codex_turn(
     let fallback_model = codex_model_override();
     let selected_model =
         codex_model_for_request(request.model.as_deref(), fallback_model.as_deref());
-    let thread_id = ensure_codex_thread(session, &root_string, selected_model.as_deref())?;
+    let permission_level = resolved_agent_permission_level(
+        request.permission_level.as_deref(),
+        AgentPermissionLevel::Ask,
+    );
+    let thread_id = ensure_codex_thread(
+        session,
+        &root_string,
+        selected_model.as_deref(),
+        permission_level,
+    )?;
+    let codex_settings = codex_execution_settings_for_permission_level(permission_level);
     let mut turn_params = json!({
         "threadId": thread_id,
         "cwd": root_string,
-        "approvalPolicy": "on-request",
+        "approvalPolicy": codex_settings.approval_policy,
         "input": [
             {
                 "type": "text",
@@ -2321,6 +2837,7 @@ fn reset_codex_session(request: CodexResetRequest) -> Result<CodexResetResponse,
 
             shared.current_thread_id = None;
             shared.current_thread_model = None;
+            shared.current_thread_permission_level = None;
             shared.pending_server_requests.clear();
             if shared.current_root != request.root {
                 restart = true;
@@ -2370,13 +2887,22 @@ fn start_gemini_turn(
 
     let root_string = path_to_string(&root);
     let selected_model = normalized_agent_model(request.model.as_deref());
+    let permission_level = resolved_agent_permission_level(
+        request.permission_level.as_deref(),
+        AgentPermissionLevel::Ask,
+    );
     let (session_id, stdin, shared) = {
         let state = gemini_acp_state();
         let mut bridge = state
             .lock()
             .map_err(|_| "Gemini bridge lock was poisoned.".to_string())?;
-        let session =
-            ensure_gemini_acp_session(&mut bridge, &app, &root_string, selected_model.as_deref())?;
+        let session = ensure_gemini_acp_session(
+            &mut bridge,
+            &app,
+            &root_string,
+            selected_model.as_deref(),
+            permission_level,
+        )?;
 
         ensure_gemini_initialized(session)?;
         let session_id = ensure_gemini_chat_session(session, &root_string)?;
@@ -3159,6 +3685,134 @@ fn request_ty_signature_help(
     Ok(signature_help_item_from_lsp(&response, &call))
 }
 
+fn request_ty_completions(
+    request: &EditorHoverRequest,
+) -> Result<Vec<EditorCompletionItem>, String> {
+    let response = request_ty_lsp_at_position(request, "textDocument/completion", json!({}))?;
+    Ok(parse_lsp_completion_items(&response))
+}
+
+fn request_ty_code_actions(request: &EditorHoverRequest) -> Result<Vec<EditorCodeAction>, String> {
+    let response = request_ty_lsp_at_position(
+        request,
+        "textDocument/codeAction",
+        json!({
+            "range": lsp_point_range(request.line, request.column),
+            "context": {
+                "diagnostics": [],
+                "only": ["quickfix", "refactor", "source"]
+            }
+        }),
+    )?;
+    Ok(parse_lsp_code_actions(&response))
+}
+
+fn request_ty_definition(request: &EditorHoverRequest) -> Result<Option<EditorLocation>, String> {
+    let response = request_ty_lsp_at_position(request, "textDocument/definition", json!({}))?;
+    Ok(parse_lsp_locations(&response).into_iter().next())
+}
+
+fn request_ty_references(request: &EditorHoverRequest) -> Result<Vec<EditorLocation>, String> {
+    let response = request_ty_lsp_at_position(
+        request,
+        "textDocument/references",
+        json!({
+            "context": {
+                "includeDeclaration": true
+            }
+        }),
+    )?;
+    Ok(parse_lsp_locations(&response))
+}
+
+fn request_ty_inlay_hints(request: &EditorHoverRequest) -> Result<Vec<EditorInlayHint>, String> {
+    let root = PathBuf::from(&request.root);
+    let path = PathBuf::from(&request.file_path);
+    let state = ty_lsp_state();
+    let mut bridge = state
+        .lock()
+        .map_err(|_| "ty language server bridge lock was poisoned.".to_string())?;
+    let session = ensure_ty_lsp_session(&mut bridge, &root)?;
+    ensure_ty_initialized(session, &root)?;
+    let (uri, _) = sync_ty_document(session, &path, &request.source)?;
+    let response = ty_send_request(
+        session,
+        "textDocument/inlayHint",
+        json!({
+            "textDocument": { "uri": uri },
+            "range": full_lsp_range(&request.source)
+        }),
+        Duration::from_secs(2),
+    )?;
+    Ok(parse_lsp_inlay_hints(&response))
+}
+
+fn request_ty_lsp_at_position(
+    request: &EditorHoverRequest,
+    method: &str,
+    mut extra_params: Value,
+) -> Result<Value, String> {
+    let root = PathBuf::from(&request.root);
+    let path = PathBuf::from(&request.file_path);
+    let state = ty_lsp_state();
+    let mut bridge = state
+        .lock()
+        .map_err(|_| "ty language server bridge lock was poisoned.".to_string())?;
+    let session = ensure_ty_lsp_session(&mut bridge, &root)?;
+    ensure_ty_initialized(session, &root)?;
+    let (uri, _) = sync_ty_document(session, &path, &request.source)?;
+
+    let mut params = json!({
+        "textDocument": { "uri": uri },
+        "position": lsp_position(request.line, request.column)
+    });
+    merge_lsp_params(&mut params, extra_params.take());
+
+    ty_send_request(session, method, params, Duration::from_secs(2))
+}
+
+fn merge_lsp_params(target: &mut Value, extra: Value) {
+    let (Some(target), Some(extra)) = (target.as_object_mut(), extra.as_object()) else {
+        return;
+    };
+    for (key, value) in extra {
+        target.insert(key.clone(), value.clone());
+    }
+}
+
+fn lsp_position(line: u32, column: u32) -> Value {
+    json!({
+        "line": line.saturating_sub(1),
+        "character": column.saturating_sub(1),
+    })
+}
+
+fn lsp_point_range(line: u32, column: u32) -> Value {
+    let position = lsp_position(line, column);
+    json!({
+        "start": position,
+        "end": position,
+    })
+}
+
+fn full_lsp_range(source: &str) -> Value {
+    let mut line = 0_u32;
+    let mut character = 0_u32;
+    for segment in source.split_inclusive('\n') {
+        if segment.ends_with('\n') {
+            line += 1;
+            character = 0;
+        } else {
+            character = segment.chars().count() as u32;
+        }
+    }
+
+    json!({
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": line, "character": character }
+    })
+}
+
 fn request_ty_diagnostics(
     root: &Path,
     path: &Path,
@@ -3346,6 +4000,12 @@ fn spawn_rust_analyzer_lsp_stdout_reader(
             };
 
             if message.get("method").is_some() {
+                if message.get("method").and_then(Value::as_str)
+                    == Some("textDocument/publishDiagnostics")
+                {
+                    handle_rust_analyzer_published_diagnostics(&shared, &message);
+                    continue;
+                }
                 if let Some(response) = rust_analyzer_server_request_response(&shared, &message) {
                     let _ = send_lsp_json(&stdin, &response);
                 }
@@ -3357,6 +4017,37 @@ fn spawn_rust_analyzer_lsp_stdout_reader(
             }
         }
     });
+}
+
+fn handle_rust_analyzer_published_diagnostics(
+    shared: &Arc<Mutex<RustAnalyzerLspSharedState>>,
+    message: &Value,
+) {
+    let Some(params) = message.get("params") else {
+        return;
+    };
+    let Some(uri) = params.get("uri").and_then(Value::as_str) else {
+        return;
+    };
+    let diagnostics = params
+        .get("diagnostics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let version = params
+        .get("version")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+
+    if let Ok(mut state) = shared.lock() {
+        state.published_diagnostics.insert(
+            uri.to_string(),
+            RustAnalyzerPublishedDiagnostics {
+                version,
+                diagnostics,
+            },
+        );
+    }
 }
 
 fn spawn_rust_analyzer_lsp_stderr_reader(stderr: impl Read + Send + 'static) {
@@ -3630,7 +4321,7 @@ fn sync_rust_analyzer_document(
     session: &RustAnalyzerLspSession,
     path: &Path,
     content: &str,
-) -> Result<String, String> {
+) -> Result<(String, i32), String> {
     let uri = path_to_file_uri(path);
     let (version, already_synced) = {
         let mut shared = session
@@ -3672,7 +4363,79 @@ fn sync_rust_analyzer_document(
         )?;
     }
 
-    Ok(uri)
+    Ok((uri, version))
+}
+
+fn request_rust_analyzer_diagnostics(
+    root: &Path,
+    path: &Path,
+    content: &str,
+) -> Result<Vec<EditorDiagnostic>, String> {
+    if language_id_from_path(path) != "rust" || probe_available_command("rust-analyzer").is_none() {
+        return Ok(Vec::new());
+    }
+
+    let state = rust_analyzer_lsp_state();
+    let mut bridge = state
+        .lock()
+        .map_err(|_| "rust-analyzer bridge lock was poisoned.".to_string())?;
+    let session = ensure_rust_analyzer_lsp_session(&mut bridge, root)?;
+    ensure_rust_analyzer_initialized(session, root)?;
+    let (uri, version) = sync_rust_analyzer_document(session, path, content)?;
+
+    match rust_analyzer_send_request(
+        session,
+        "textDocument/diagnostic",
+        json!({
+            "textDocument": { "uri": uri }
+        }),
+        Duration::from_secs(3),
+    ) {
+        Ok(response) => Ok(parse_lsp_diagnostics(&response, "rust-analyzer", content)),
+        Err(_) => Ok(wait_for_rust_analyzer_published_diagnostics(
+            session,
+            &uri,
+            version,
+            content,
+            Duration::from_millis(1_500),
+        )
+        .unwrap_or_default()),
+    }
+}
+
+fn wait_for_rust_analyzer_published_diagnostics(
+    session: &RustAnalyzerLspSession,
+    uri: &str,
+    min_version: i32,
+    source: &str,
+    timeout: Duration,
+) -> Option<Vec<EditorDiagnostic>> {
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Ok(shared) = session.shared.lock() {
+            if let Some(published) = shared.published_diagnostics.get(uri) {
+                let version_matches = published
+                    .version
+                    .map(|version| version >= min_version)
+                    .unwrap_or(true);
+
+                if version_matches {
+                    return Some(parse_lsp_diagnostic_items(
+                        &published.diagnostics,
+                        "rust-analyzer",
+                        source,
+                    ));
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return None;
+        }
+
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn rust_analyzer_semantic_tokens_for_document(
@@ -3690,7 +4453,7 @@ fn rust_analyzer_semantic_tokens_for_document(
         .map_err(|_| "rust-analyzer bridge lock was poisoned.".to_string())?;
     let session = ensure_rust_analyzer_lsp_session(&mut bridge, root)?;
     ensure_rust_analyzer_initialized(session, root)?;
-    let uri = sync_rust_analyzer_document(session, path, content)?;
+    let (uri, _) = sync_rust_analyzer_document(session, path, content)?;
 
     let response = rust_analyzer_send_request(
         session,
@@ -3731,7 +4494,7 @@ fn request_rust_analyzer_hover(request: &EditorHoverRequest) -> Result<Option<Ho
         .map_err(|_| "rust-analyzer bridge lock was poisoned.".to_string())?;
     let session = ensure_rust_analyzer_lsp_session(&mut bridge, &rust_root)?;
     ensure_rust_analyzer_initialized(session, &rust_root)?;
-    let uri = sync_rust_analyzer_document(session, &path, &request.source)?;
+    let (uri, _) = sync_rust_analyzer_document(session, &path, &request.source)?;
 
     let params = json!({
         "textDocument": { "uri": uri },
@@ -3741,12 +4504,15 @@ fn request_rust_analyzer_hover(request: &EditorHoverRequest) -> Result<Option<Ho
         }
     });
 
-    let mut response = rust_analyzer_send_request(
+    let mut response = match rust_analyzer_send_request(
         session,
         "textDocument/hover",
         params.clone(),
         Duration::from_secs(2),
-    )?;
+    ) {
+        Ok(response) => response,
+        Err(_) => return Ok(rust_tree_sitter_hover_for_request(request)),
+    };
     for delay_ms in RUST_ANALYZER_HOVER_RETRY_DELAYS_MS {
         if hover_item_from_lsp_with_provider(
             &response,
@@ -3761,12 +4527,15 @@ fn request_rust_analyzer_hover(request: &EditorHoverRequest) -> Result<Option<Ho
         }
 
         thread::sleep(Duration::from_millis(*delay_ms));
-        response = rust_analyzer_send_request(
+        response = match rust_analyzer_send_request(
             session,
             "textDocument/hover",
             params.clone(),
             Duration::from_secs(2),
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(_) => return Ok(rust_tree_sitter_hover_for_request(request)),
+        };
     }
     Ok(hover_item_from_lsp_with_provider(
         &response,
@@ -5038,13 +5807,20 @@ fn editor_diagnostic_from_lsp(item: &Value, tool: &str, source: &str) -> Option<
         Some(4) => "info",
         _ => "warning",
     };
+    let diagnostic_source = item.get("source").and_then(Value::as_str);
     let code = item
         .get("code")
         .and_then(|value| value_to_string(Some(value)))
-        .unwrap_or_else(|| tool.to_string());
+        .filter(|value| !value.trim().is_empty());
+    let module = match (diagnostic_source, code.as_deref()) {
+        (Some(source), Some(code)) if source != tool => format!("{} {}", source, code),
+        (_, Some(code)) => code.to_string(),
+        (Some(source), None) => source.to_string(),
+        (None, None) => tool.to_string(),
+    };
 
     Some(EditorDiagnostic {
-        module: code,
+        module,
         from: offset_from_line_column(source, line, column),
         to: offset_from_line_column(source, end_line, end_column),
         line,
@@ -5052,6 +5828,215 @@ fn editor_diagnostic_from_lsp(item: &Value, tool: &str, source: &str) -> Option<
         severity: severity.into(),
         message,
     })
+}
+
+fn parse_lsp_completion_items(response: &Value) -> Vec<EditorCompletionItem> {
+    lsp_result_array(response)
+        .into_iter()
+        .filter_map(editor_completion_item_from_lsp)
+        .collect()
+}
+
+fn editor_completion_item_from_lsp(item: &Value) -> Option<EditorCompletionItem> {
+    let label = item.get("label")?.as_str()?.to_string();
+    let detail = item
+        .get("detail")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let insert_text = item
+        .get("insertText")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let kind = lsp_completion_kind_label(item.get("kind").and_then(Value::as_u64)).to_string();
+
+    Some(EditorCompletionItem {
+        label,
+        detail,
+        kind,
+        insert_text,
+    })
+}
+
+fn parse_lsp_code_actions(response: &Value) -> Vec<EditorCodeAction> {
+    lsp_result_array(response)
+        .into_iter()
+        .filter_map(|item| {
+            Some(EditorCodeAction {
+                title: item.get("title")?.as_str()?.to_string(),
+                kind: item.get("kind").and_then(Value::as_str).map(str::to_string),
+                edit: item.get("edit").cloned(),
+                command: item.get("command").cloned(),
+                is_preferred: item
+                    .get("isPreferred")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn parse_lsp_locations(response: &Value) -> Vec<EditorLocation> {
+    lsp_result_array(response)
+        .into_iter()
+        .filter_map(editor_location_from_lsp)
+        .collect()
+}
+
+fn editor_location_from_lsp(item: &Value) -> Option<EditorLocation> {
+    let uri = item
+        .get("uri")
+        .or_else(|| item.get("targetUri"))?
+        .as_str()?
+        .to_string();
+    let range = item
+        .get("targetSelectionRange")
+        .or_else(|| item.get("targetRange"))
+        .or_else(|| item.get("range"))?;
+    let start = range.get("start")?;
+    let end = range.get("end").unwrap_or(start);
+    let line = lsp_position_line(start);
+    let column = lsp_position_column(start);
+    let end_line = lsp_position_line(end);
+    let end_column = lsp_position_column(end);
+
+    Some(EditorLocation {
+        path: file_uri_to_path_string(&uri),
+        uri,
+        line,
+        column,
+        end_line,
+        end_column,
+    })
+}
+
+fn parse_lsp_inlay_hints(response: &Value) -> Vec<EditorInlayHint> {
+    lsp_result_array(response)
+        .into_iter()
+        .filter_map(|item| {
+            let position = item.get("position")?;
+            let label = lsp_hint_label(item.get("label")?)?;
+            Some(EditorInlayHint {
+                label,
+                line: lsp_position_line(position),
+                column: lsp_position_column(position),
+                kind: lsp_inlay_hint_kind_label(item.get("kind").and_then(Value::as_u64))
+                    .to_string(),
+            })
+        })
+        .collect()
+}
+
+fn lsp_result_array(response: &Value) -> Vec<&Value> {
+    if let Some(items) = response.as_array() {
+        return items.iter().collect();
+    }
+    if let Some(items) = response.get("items").and_then(Value::as_array) {
+        return items.iter().collect();
+    }
+    if let Some(items) = response
+        .get("result")
+        .and_then(|result| result.get("items"))
+        .and_then(Value::as_array)
+    {
+        return items.iter().collect();
+    }
+    if let Some(items) = response.get("result").and_then(Value::as_array) {
+        return items.iter().collect();
+    }
+    Vec::new()
+}
+
+fn lsp_position_line(position: &Value) -> u32 {
+    position
+        .get("line")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as u32
+        + 1
+}
+
+fn lsp_position_column(position: &Value) -> u32 {
+    position
+        .get("character")
+        .and_then(Value::as_u64)
+        .unwrap_or_default() as u32
+        + 1
+}
+
+fn lsp_hint_label(label: &Value) -> Option<String> {
+    if let Some(value) = label.as_str() {
+        return Some(value.to_string());
+    }
+    label.as_array().map(|parts| {
+        parts
+            .iter()
+            .filter_map(|part| part.get("value").and_then(Value::as_str))
+            .collect::<String>()
+    })
+}
+
+fn lsp_completion_kind_label(kind: Option<u64>) -> &'static str {
+    match kind {
+        Some(2) => "method",
+        Some(3) => "function",
+        Some(4) => "constructor",
+        Some(5) => "field",
+        Some(6) => "variable",
+        Some(7) => "class",
+        Some(8) => "interface",
+        Some(9) => "module",
+        Some(10) => "property",
+        Some(12) => "value",
+        Some(13) => "enum",
+        Some(14) => "keyword",
+        Some(15) => "snippet",
+        Some(16) => "text",
+        Some(17) => "color",
+        Some(18) => "file",
+        Some(21) => "constant",
+        Some(22) => "struct",
+        Some(23) => "event",
+        Some(24) => "operator",
+        Some(25) => "type-parameter",
+        _ => "symbol",
+    }
+}
+
+fn lsp_inlay_hint_kind_label(kind: Option<u64>) -> &'static str {
+    match kind {
+        Some(1) => "type",
+        Some(2) => "parameter",
+        _ => "hint",
+    }
+}
+
+fn file_uri_to_path_string(uri: &str) -> Option<String> {
+    let raw = uri.strip_prefix("file://")?;
+    let raw = if raw.starts_with('/') && raw.get(2..3) == Some(":") {
+        &raw[1..]
+    } else {
+        raw
+    };
+    Some(percent_decode_uri_path(raw))
+}
+
+fn percent_decode_uri_path(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(hex) = std::str::from_utf8(&bytes[index + 1..index + 3]) {
+                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                    output.push(decoded);
+                    index += 3;
+                    continue;
+                }
+            }
+        }
+        output.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&output).to_string()
 }
 
 fn path_to_file_uri(path: &Path) -> String {
@@ -5213,6 +6198,23 @@ async fn run_rust_tooling_action(request: RustToolingRequest) -> Result<ProcessO
     tauri::async_runtime::spawn_blocking(move || run_rust_tooling_action_sync(request))
         .await
         .map_err(|err| err.to_string())?
+}
+
+#[tauri::command]
+async fn analyze_rust_diagnostics(
+    request: RustDiagnosticsRequest,
+) -> Result<Vec<EditorDiagnostic>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = PathBuf::from(&request.root);
+        let file_path = PathBuf::from(&request.file_path);
+        let rust_root = find_rust_workspace_root(&file_path)
+            .or_else(|| find_rust_workspace_root(&root))
+            .unwrap_or(root);
+
+        request_rust_analyzer_diagnostics(&rust_root, &file_path, &request.source)
+    })
+    .await
+    .map_err(|err| err.to_string())?
 }
 
 fn run_rust_tooling_action_sync(request: RustToolingRequest) -> Result<ProcessOutcome, String> {
@@ -6581,54 +7583,215 @@ fn normalized_agent_model(model: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentPermissionLevel {
+    Ask,
+    AutoEdits,
+    Plan,
+    FullAuto,
+}
+
+struct CodexExecutionSettings {
+    approval_policy: &'static str,
+    sandbox: &'static str,
+}
+
+fn resolved_agent_permission_level(
+    permission_level: Option<&str>,
+    default_level: AgentPermissionLevel,
+) -> AgentPermissionLevel {
+    match permission_level
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some("autoEdits" | "auto_edits" | "auto-edit" | "acceptEdits" | "auto_edit") => {
+            AgentPermissionLevel::AutoEdits
+        }
+        Some("plan" | "readOnly" | "read_only" | "read-only") => AgentPermissionLevel::Plan,
+        Some("fullAuto" | "full_auto" | "full-auto" | "yolo" | "dontAsk") => {
+            AgentPermissionLevel::FullAuto
+        }
+        Some("ask" | "default" | "onRequest" | "on-request") => AgentPermissionLevel::Ask,
+        _ => default_level,
+    }
+}
+
+fn default_permission_level_for_binary(binary_key: &str) -> AgentPermissionLevel {
+    match binary_key {
+        "claude" => AgentPermissionLevel::AutoEdits,
+        "kilo" => AgentPermissionLevel::FullAuto,
+        _ => AgentPermissionLevel::Ask,
+    }
+}
+
+fn claude_permission_mode_for_level(permission_level: AgentPermissionLevel) -> &'static str {
+    match permission_level {
+        AgentPermissionLevel::Ask => "default",
+        AgentPermissionLevel::AutoEdits => "acceptEdits",
+        AgentPermissionLevel::Plan => "plan",
+        AgentPermissionLevel::FullAuto => "dontAsk",
+    }
+}
+
+fn gemini_approval_mode_for_level(permission_level: AgentPermissionLevel) -> &'static str {
+    match permission_level {
+        AgentPermissionLevel::Ask => "default",
+        AgentPermissionLevel::AutoEdits => "auto_edit",
+        AgentPermissionLevel::Plan => "plan",
+        AgentPermissionLevel::FullAuto => "yolo",
+    }
+}
+
+fn codex_execution_settings_for_permission_level(
+    permission_level: AgentPermissionLevel,
+) -> CodexExecutionSettings {
+    match permission_level {
+        AgentPermissionLevel::Ask => CodexExecutionSettings {
+            approval_policy: "on-request",
+            sandbox: "workspace-write",
+        },
+        AgentPermissionLevel::AutoEdits => CodexExecutionSettings {
+            approval_policy: "on-failure",
+            sandbox: "workspace-write",
+        },
+        AgentPermissionLevel::Plan => CodexExecutionSettings {
+            approval_policy: "never",
+            sandbox: "read-only",
+        },
+        AgentPermissionLevel::FullAuto => CodexExecutionSettings {
+            approval_policy: "never",
+            sandbox: "workspace-write",
+        },
+    }
+}
+
 fn agent_args_with_selected_model(
     binary: &str,
     args: &[String],
     model: Option<&str>,
+    permission_level: Option<&str>,
 ) -> Vec<String> {
-    let Some(model) = normalized_agent_model(model) else {
-        return args.to_vec();
-    };
     let binary_key = Path::new(binary)
         .file_stem()
         .and_then(|value| value.to_str())
         .unwrap_or(binary)
         .to_ascii_lowercase();
+    let model = normalized_agent_model(model);
+    let permission_level = resolved_agent_permission_level(
+        permission_level,
+        default_permission_level_for_binary(&binary_key),
+    );
 
     match binary_key.as_str() {
-        "claude" | "gemini" => {
-            let mut resolved = Vec::with_capacity(args.len() + 2);
-            resolved.push("--model".into());
-            resolved.push(model);
+        "claude" => {
+            claude_args_with_noninteractive_permissions(args, model.as_deref(), permission_level)
+        }
+        "gemini" => {
+            let has_approval_mode = args
+                .iter()
+                .any(|value| value == "--approval-mode" || value.starts_with("--approval-mode="));
+            let mut resolved =
+                Vec::with_capacity(args.len() + if model.is_some() { 2 } else { 0 } + 2);
+            if let Some(model) = model {
+                resolved.push("--model".into());
+                resolved.push(model);
+            }
+            if !has_approval_mode {
+                resolved.push("--approval-mode".into());
+                resolved.push(gemini_approval_mode_for_level(permission_level).into());
+            }
             resolved.extend_from_slice(args);
             resolved
         }
-        "kilo" => {
-            if args.first().is_some_and(|value| value == "run") {
-                let mut resolved = Vec::with_capacity(args.len() + 2);
-                resolved.push(args[0].clone());
-                resolved.push("--model".into());
-                resolved.push(model);
-                resolved.extend_from_slice(&args[1..]);
-                resolved
-            } else {
-                let mut resolved = Vec::with_capacity(args.len() + 2);
-                resolved.push("--model".into());
-                resolved.push(model);
-                resolved.extend_from_slice(args);
-                resolved
-            }
-        }
+        "kilo" => kilo_args_with_permissions(args, model.as_deref(), permission_level),
         _ => args.to_vec(),
     }
 }
 
-fn gemini_acp_args(model: Option<&str>) -> Vec<String> {
-    let Some(model) = normalized_agent_model(model) else {
-        return vec!["--acp".into()];
-    };
+fn claude_args_with_noninteractive_permissions(
+    args: &[String],
+    model: Option<&str>,
+    permission_level: AgentPermissionLevel,
+) -> Vec<String> {
+    let has_permission_mode = args
+        .iter()
+        .any(|value| value == "--permission-mode" || value.starts_with("--permission-mode="));
+    let extra_capacity =
+        if has_permission_mode { 0 } else { 2 } + if model.is_some() { 2 } else { 0 };
+    let mut resolved = Vec::with_capacity(args.len() + extra_capacity);
 
-    vec!["--model".into(), model, "--acp".into()]
+    if !has_permission_mode {
+        resolved.push("--permission-mode".into());
+        resolved.push(claude_permission_mode_for_level(permission_level).into());
+    }
+    if let Some(model) = model {
+        resolved.push("--model".into());
+        resolved.push(model.into());
+    }
+    resolved.extend_from_slice(args);
+    resolved
+}
+
+fn kilo_args_with_permissions(
+    args: &[String],
+    model: Option<&str>,
+    permission_level: AgentPermissionLevel,
+) -> Vec<String> {
+    let body = args
+        .iter()
+        .filter(|value| value.as_str() != "--auto")
+        .cloned()
+        .collect::<Vec<_>>();
+    let auto = permission_level == AgentPermissionLevel::FullAuto;
+
+    if body.first().is_some_and(|value| value == "run") {
+        let mut resolved = Vec::with_capacity(
+            body.len() + if model.is_some() { 2 } else { 0 } + usize::from(auto),
+        );
+        resolved.push(body[0].clone());
+        if let Some(model) = model {
+            resolved.push("--model".into());
+            resolved.push(model.into());
+        }
+        if auto {
+            resolved.push("--auto".into());
+        }
+        resolved.extend_from_slice(&body[1..]);
+        return resolved;
+    }
+
+    let mut resolved =
+        Vec::with_capacity(body.len() + if model.is_some() { 2 } else { 0 } + usize::from(auto));
+    if let Some(model) = model {
+        resolved.push("--model".into());
+        resolved.push(model.into());
+    }
+    if auto {
+        resolved.push("--auto".into());
+    }
+    resolved.extend_from_slice(&body);
+    resolved
+}
+
+#[cfg(test)]
+fn gemini_acp_args(model: Option<&str>) -> Vec<String> {
+    gemini_acp_args_with_permission(model, AgentPermissionLevel::Ask)
+}
+
+fn gemini_acp_args_with_permission(
+    model: Option<&str>,
+    permission_level: AgentPermissionLevel,
+) -> Vec<String> {
+    let model = normalized_agent_model(model);
+    let mut args = Vec::with_capacity(if model.is_some() { 5 } else { 3 });
+    if let Some(model) = model {
+        args.push("--model".into());
+        args.push(model);
+    }
+    args.push("--approval-mode".into());
+    args.push(gemini_approval_mode_for_level(permission_level).into());
+    args.push("--acp".into());
+    args
 }
 
 fn detect_codex_model_override() -> Option<String> {
@@ -7272,6 +8435,7 @@ fn ensure_codex_thread(
     session: &CodexAppServerSession,
     root: &str,
     selected_model: Option<&str>,
+    permission_level: AgentPermissionLevel,
 ) -> Result<String, String> {
     {
         let shared = session
@@ -7279,17 +8443,20 @@ fn ensure_codex_thread(
             .lock()
             .map_err(|_| "Codex shared state lock was poisoned.".to_string())?;
         if let Some(thread_id) = &shared.current_thread_id {
-            if shared.current_thread_model.as_deref() == selected_model {
+            if shared.current_thread_model.as_deref() == selected_model
+                && shared.current_thread_permission_level == Some(permission_level)
+            {
                 return Ok(thread_id.clone());
             }
         }
     }
 
+    let settings = codex_execution_settings_for_permission_level(permission_level);
     let mut params = json!({
         "cwd": root,
-        "approvalPolicy": "on-request",
+        "approvalPolicy": settings.approval_policy,
         "approvalsReviewer": "user",
-        "sandbox": "workspace-write",
+        "sandbox": settings.sandbox,
         "ephemeral": false,
         "experimentalRawEvents": false,
         "persistExtendedHistory": true,
@@ -7309,6 +8476,7 @@ fn ensure_codex_thread(
     if let Ok(mut shared) = session.shared.lock() {
         shared.current_thread_id = Some(thread_id.clone());
         shared.current_thread_model = selected_model.map(str::to_string);
+        shared.current_thread_permission_level = Some(permission_level);
     }
 
     Ok(thread_id)
@@ -7401,7 +8569,7 @@ fn codex_respond_to_server_request(
             return Err(format!(
                 "Hematite cannot answer the Codex request type `{}` yet.",
                 other
-            ))
+            ));
         }
     };
 
@@ -7661,6 +8829,7 @@ fn ensure_gemini_acp_session<'a>(
     app: &tauri::AppHandle,
     root: &str,
     selected_model: Option<&str>,
+    permission_level: AgentPermissionLevel,
 ) -> Result<&'a mut GeminiAcpSession, String> {
     let mut needs_restart = bridge.session.is_none();
     let selected_model = normalized_agent_model(selected_model);
@@ -7671,15 +8840,22 @@ fn ensure_gemini_acp_session<'a>(
             .try_wait()
             .map_err(|err| format!("Could not inspect Gemini background process. {}", err))?
             .is_some();
-        let (current_root, current_model) = {
+        let (current_root, current_model, current_permission_level) = {
             let shared = session
                 .shared
                 .lock()
                 .map_err(|_| "Gemini shared state lock was poisoned.".to_string())?;
-            (shared.current_root.clone(), shared.current_model.clone())
+            (
+                shared.current_root.clone(),
+                shared.current_model.clone(),
+                shared.current_permission_level,
+            )
         };
 
-        needs_restart = exited || current_root != root || current_model != selected_model;
+        needs_restart = exited
+            || current_root != root
+            || current_model != selected_model
+            || current_permission_level != permission_level;
     }
 
     if needs_restart {
@@ -7690,6 +8866,7 @@ fn ensure_gemini_acp_session<'a>(
             app,
             root,
             selected_model.as_deref(),
+            permission_level,
         )?);
     }
 
@@ -7703,9 +8880,10 @@ fn spawn_gemini_acp_session(
     app: &tauri::AppHandle,
     root: &str,
     selected_model: Option<&str>,
+    permission_level: AgentPermissionLevel,
 ) -> Result<GeminiAcpSession, String> {
     let stored = load_agent_credentials();
-    let args = gemini_acp_args(selected_model);
+    let args = gemini_acp_args_with_permission(selected_model, permission_level);
     let mut prepared = prepare_cli_command("gemini", &args);
     prepared.command.stdin(Stdio::piped());
     prepared.command.stdout(Stdio::piped());
@@ -7739,6 +8917,7 @@ fn spawn_gemini_acp_session(
     let shared = Arc::new(Mutex::new(GeminiSharedState::new(
         root.to_string(),
         normalized_agent_model(selected_model),
+        permission_level,
     )));
 
     spawn_gemini_stdout_reader(app.clone(), shared.clone(), stdin.clone(), stdout);
@@ -8338,6 +9517,289 @@ fn apply_workspace_env(command: &mut Command, cwd: &Path) {
     command.env("PATH", combined);
 }
 
+fn run_terminal_command_in_pty(
+    command_text: &str,
+    resolved_cwd: &Path,
+    stored: &AgentCredentials,
+) -> Result<(bool, String), String> {
+    let pty_system = native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: TERMINAL_PTY_ROWS,
+            cols: TERMINAL_PTY_COLS,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|err| format!("Could not open terminal PTY. {err}"))?;
+
+    let script = terminal_pty_shell_script(command_text, resolved_cwd);
+    let mut command = terminal_pty_command(&script, resolved_cwd);
+    apply_agent_env_to_pty(&mut command, stored);
+    apply_workspace_env_to_pty(&mut command, resolved_cwd);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|err| format!("Could not read from terminal PTY. {err}"))?;
+    let (output_tx, output_rx) = mpsc::channel::<Vec<u8>>();
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(len) => {
+                    if output_tx.send(buffer[..len].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut child = pair
+        .slave
+        .spawn_command(command)
+        .map_err(|err| format!("Could not start terminal shell. {err}"))?;
+    drop(pair.slave);
+
+    let started_at = Instant::now();
+    let timeout = Duration::from_secs(60);
+    let mut output = Vec::new();
+    let status = loop {
+        while let Ok(chunk) = output_rx.try_recv() {
+            output.extend(chunk);
+        }
+
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|err| format!("Terminal shell poll failed. {err}"))?
+        {
+            break status;
+        }
+
+        if started_at.elapsed() >= timeout {
+            let _ = child.kill();
+            let status = child
+                .wait()
+                .map_err(|err| format!("Terminal shell kill wait failed. {err}"))?;
+            output.extend_from_slice(b"\n[hematite] command timed out after 60 seconds\n");
+            break status;
+        }
+
+        thread::sleep(Duration::from_millis(20));
+    };
+
+    let drain_until = Instant::now() + Duration::from_millis(250);
+    while Instant::now() < drain_until {
+        match output_rx.recv_timeout(Duration::from_millis(20)) {
+            Ok(chunk) => output.extend(chunk),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    Ok((
+        status.success(),
+        String::from_utf8_lossy(&output).to_string(),
+    ))
+}
+
+fn write_to_terminal_session(session_id: &str, input: &str) -> Result<(), String> {
+    let writer = {
+        let sessions = terminal_sessions()
+            .sessions
+            .lock()
+            .map_err(|_| "Terminal session registry lock was poisoned.".to_string())?;
+        sessions
+            .get(session_id)
+            .map(|session| Arc::clone(&session.writer))
+            .ok_or_else(|| "Terminal session is no longer active.".to_string())?
+    };
+
+    let mut writer = writer
+        .lock()
+        .map_err(|_| "Terminal session writer lock was poisoned.".to_string())?;
+    writer
+        .write_all(input.as_bytes())
+        .and_then(|_| writer.flush())
+        .map_err(|err| format!("Could not write to terminal session. {err}"))
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_session_shell_command(cwd: &Path) -> (CommandBuilder, &'static str) {
+    let mut command = CommandBuilder::new("powershell.exe");
+    command.args(["-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass"]);
+    command.cwd(cwd);
+    command.env("TERM", "xterm-256color");
+    (command, "PowerShell")
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_session_shell_command(cwd: &Path) -> (CommandBuilder, &'static str) {
+    let shell = env::var("SHELL").unwrap_or_else(|_| "sh".into());
+    let mut command = CommandBuilder::new(shell);
+    command.cwd(cwd);
+    (command, "shell")
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_session_command_input(command_text: &str) -> String {
+    let command = normalize_powershell_terminal_command(command_text);
+    format!(
+        "$global:LASTEXITCODE = $null; {command}; \
+         $__hematiteOk = $?; \
+         $__hematiteLastExit = $LASTEXITCODE; \
+         $__hematiteExit = if (($__hematiteLastExit -as [int]) -ne $null) {{ [int]$__hematiteLastExit }} elseif ($__hematiteOk) {{ 0 }} else {{ 1 }}; \
+         [Console]::Out.WriteLine('{status}' + $__hematiteExit); \
+         [Console]::Out.WriteLine('{cwd}' + (Get-Location).Path)\r\n",
+        command = command,
+        status = TERMINAL_STATUS_MARKER,
+        cwd = TERMINAL_CWD_MARKER,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn normalize_powershell_terminal_command(command_text: &str) -> String {
+    let trimmed = command_text.trim();
+    let unquoted = trimmed.trim_matches('"').trim_matches('\'');
+    let normalized = unquoted.replace('/', "\\").to_ascii_lowercase();
+    let normalized = normalized.strip_prefix(".\\").unwrap_or(&normalized);
+
+    if matches!(
+        normalized,
+        ".venv\\scripts\\activate"
+            | ".venv\\scripts\\activate.ps1"
+            | "venv\\scripts\\activate"
+            | "venv\\scripts\\activate.ps1"
+    ) {
+        return format!(". {}", powershell_quote(".\\.venv\\Scripts\\Activate.ps1"));
+    }
+
+    trimmed.to_string()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_session_command_input(command_text: &str) -> String {
+    format!(
+        "{command}\n__hematite_exit=$?; printf '%s%s\n' '{status}' \"$__hematite_exit\"; printf '%s%s\n' '{cwd}' \"$PWD\"\n",
+        command = command_text,
+        status = TERMINAL_STATUS_MARKER,
+        cwd = TERMINAL_CWD_MARKER,
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_pty_command(script: &str, cwd: &Path) -> CommandBuilder {
+    let mut command = CommandBuilder::new("powershell.exe");
+    command.args([
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        script,
+    ]);
+    command.cwd(cwd);
+    command
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_pty_command(script: &str, cwd: &Path) -> CommandBuilder {
+    let mut command = CommandBuilder::new("sh");
+    command.args(["-lc", script]);
+    command.cwd(cwd);
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn terminal_pty_shell_script(command_text: &str, cwd: &Path) -> String {
+    format!(
+        "$ErrorActionPreference = 'Continue'; \
+         try {{ Set-Location -LiteralPath {cwd}; }} catch {{ Write-Error $_; Write-Output ('{marker}' + {cwd}); exit 1 }}; \
+         $global:LASTEXITCODE = $null; \
+         try {{ Invoke-Expression {input}; }} catch {{ Write-Error $_; }}; \
+         $exitCode = if (($LASTEXITCODE -as [int]) -ne $null) {{ [int]$LASTEXITCODE }} elseif ($?) {{ 0 }} else {{ 1 }}; \
+         Write-Output ('{marker}' + (Get-Location).Path); \
+         exit $exitCode",
+        cwd = powershell_quote(&path_to_string(cwd)),
+        input = powershell_quote(command_text),
+        marker = TERMINAL_CWD_MARKER,
+    )
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_pty_shell_script(command_text: &str, cwd: &Path) -> String {
+    format!(
+        "cd {cwd} && {{ {input}; }}; status=$?; printf '%s%s\n' '{marker}' \"$PWD\"; exit $status",
+        cwd = shell_quote(&path_to_string(cwd)),
+        input = command_text,
+        marker = TERMINAL_CWD_MARKER,
+    )
+}
+
+fn apply_agent_env_to_pty(command: &mut CommandBuilder, stored: &AgentCredentials) {
+    if let Some(value) = effective_value(&stored.openai_api_key, "OPENAI_API_KEY") {
+        command.env("OPENAI_API_KEY", value);
+    }
+    if let Some(value) = effective_value(&stored.gemini_api_key, "GEMINI_API_KEY") {
+        command.env("GEMINI_API_KEY", value);
+    }
+    if let Some(value) = effective_value(&stored.google_api_key, "GOOGLE_API_KEY") {
+        command.env("GOOGLE_API_KEY", value);
+    }
+    if let Some(value) = effective_value(&stored.google_cloud_project, "GOOGLE_CLOUD_PROJECT") {
+        command.env("GOOGLE_CLOUD_PROJECT", value);
+    }
+    if let Some(value) = effective_value(&stored.google_cloud_location, "GOOGLE_CLOUD_LOCATION") {
+        command.env("GOOGLE_CLOUD_LOCATION", value);
+    }
+    if let Some(value) = effective_value(
+        &stored.google_application_credentials,
+        "GOOGLE_APPLICATION_CREDENTIALS",
+    ) {
+        command.env("GOOGLE_APPLICATION_CREDENTIALS", value);
+    }
+    if let Some(value) = effective_value(&stored.anthropic_api_key, "ANTHROPIC_API_KEY") {
+        command.env("ANTHROPIC_API_KEY", value);
+    }
+    if let Some(value) = effective_value(&stored.kilo_api_key, "KILO_API_KEY") {
+        command.env("KILO_API_KEY", value);
+    }
+}
+
+fn apply_workspace_env_to_pty(command: &mut CommandBuilder, cwd: &Path) {
+    let Some(project_root) = find_python_workspace_root(cwd) else {
+        return;
+    };
+
+    let venv_dir = project_root.join(".venv");
+    let bin_dir = venv_bin_dir(&project_root);
+    if !bin_dir.exists() {
+        return;
+    }
+
+    command.env("VIRTUAL_ENV", path_to_string(&venv_dir));
+    command.env("UV_PROJECT_ENVIRONMENT", path_to_string(&venv_dir));
+
+    let path_separator = if cfg!(target_os = "windows") {
+        ";"
+    } else {
+        ":"
+    };
+    let existing_path = env::var_os("PATH").unwrap_or_default();
+    let combined = if existing_path.is_empty() {
+        path_to_string(&bin_dir)
+    } else {
+        format!(
+            "{}{}{}",
+            path_to_string(&bin_dir),
+            path_separator,
+            existing_path.to_string_lossy()
+        )
+    };
+    command.env("PATH", combined);
+}
+
 fn split_terminal_output(stdout: &str, fallback_cwd: &Path) -> (String, String) {
     let mut cwd = path_to_string(fallback_cwd);
     let mut lines = Vec::new();
@@ -8355,6 +9817,44 @@ fn split_terminal_output(stdout: &str, fallback_cwd: &Path) -> (String, String) 
     }
 
     (lines.join("\n").trim().to_string(), cwd)
+}
+
+fn strip_terminal_control_sequences(output: &str) -> String {
+    let mut cleaned = String::with_capacity(output.len());
+    let mut chars = output.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            match chars.peek().copied() {
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\u{7}' {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if ch == '\r' {
+            continue;
+        }
+
+        cleaned.push(ch);
+    }
+
+    cleaned
 }
 
 fn detect_workspace_root() -> Result<String, String> {
@@ -10494,6 +11994,11 @@ pub fn run() {
             extract_symbols,
             analyze_editor_semantics,
             request_editor_hover,
+            request_editor_completions,
+            request_editor_code_actions,
+            request_editor_definition,
+            request_editor_references,
+            request_editor_inlay_hints,
             build_compact_context,
             refresh_agent_health,
             get_language_capabilities,
@@ -10509,7 +12014,14 @@ pub fn run() {
             inspect_c_family_environment,
             inspect_rust_environment,
             execute_terminal_command,
+            start_terminal_session,
+            write_terminal_session_input,
+            write_terminal_session_command,
+            stop_terminal_session,
+            resize_terminal_session,
             refresh_tool_statuses,
+            start_codeshare_session,
+            join_codeshare_session,
             run_agent,
             start_codex_turn,
             respond_to_codex_approval,
@@ -10518,6 +12030,7 @@ pub fn run() {
             respond_to_gemini_approval,
             reset_gemini_session,
             analyze_python_imports,
+            analyze_rust_diagnostics,
             install_missing_python_imports,
             run_python_tooling_action,
             run_rust_tooling_action
@@ -10537,10 +12050,7 @@ mod tests {
 
         assert_eq!(status.language_id, "rust");
         assert_eq!(status.provider_name, "rust-analyzer");
-        assert_eq!(
-            status.availability,
-            LanguageProviderAvailability::Missing
-        );
+        assert_eq!(status.availability, LanguageProviderAvailability::Missing);
         assert!(status.supported_features.is_empty());
         assert_eq!(
             status.inactive_reason.as_deref(),
@@ -10564,14 +12074,21 @@ mod tests {
         );
 
         assert_eq!(status.availability, LanguageProviderAvailability::Active);
-        assert_eq!(status.resolved_path.as_deref(), Some("/tools/rust-analyzer"));
-        assert!(status
-            .supported_features
-            .contains(&LanguageFeature::Diagnostics));
+        assert_eq!(
+            status.resolved_path.as_deref(),
+            Some("/tools/rust-analyzer")
+        );
+        assert!(
+            status
+                .supported_features
+                .contains(&LanguageFeature::Diagnostics)
+        );
         assert!(status.supported_features.contains(&LanguageFeature::Hover));
-        assert!(status
-            .supported_features
-            .contains(&LanguageFeature::SemanticTokens));
+        assert!(
+            status
+                .supported_features
+                .contains(&LanguageFeature::SemanticTokens)
+        );
         assert!(status.inactive_reason.is_none());
         assert!(status.recommended_action.is_none());
     }
@@ -10603,11 +12120,7 @@ mod tests {
             })
             .collect();
 
-        assert!(providers.contains(&(
-            "python",
-            "ruff",
-            LanguageProviderAvailability::Active
-        )));
+        assert!(providers.contains(&("python", "ruff", LanguageProviderAvailability::Active)));
         assert!(providers.contains(&("python", "ty", LanguageProviderAvailability::Active)));
         assert!(providers.contains(&(
             "rust",
@@ -10615,11 +12128,7 @@ mod tests {
             LanguageProviderAvailability::Active
         )));
         assert!(providers.contains(&("c", "clangd", LanguageProviderAvailability::Degraded)));
-        assert!(providers.contains(&(
-            "cpp",
-            "clangd",
-            LanguageProviderAvailability::Degraded
-        )));
+        assert!(providers.contains(&("cpp", "clangd", LanguageProviderAvailability::Degraded)));
         assert!(providers.contains(&(
             "cuda-cpp",
             "clangd",
@@ -10673,7 +12182,9 @@ mod tests {
             permission_level: "ask".to_string(),
             workspace_root: Some("C:/work/project".to_string()),
         });
-        let fetched = registry.get_session(&created.id).expect("session should exist");
+        let fetched = registry
+            .get_session(&created.id)
+            .expect("session should exist");
 
         assert_eq!(created.id, fetched.id);
         assert_eq!(fetched.provider_id, "codex");
@@ -10955,6 +12466,142 @@ Found 1 diagnostic";
     }
 
     #[test]
+    fn lsp_completion_items_are_parsed_for_python_features() {
+        let response = json!({
+            "isIncomplete": false,
+            "items": [{
+                "label": "DataFrame",
+                "kind": 7,
+                "detail": "class pandas.DataFrame",
+                "insertText": "DataFrame"
+            }]
+        });
+
+        let items = parse_lsp_completion_items(&response);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label, "DataFrame");
+        assert_eq!(items[0].detail.as_deref(), Some("class pandas.DataFrame"));
+        assert_eq!(items[0].insert_text.as_deref(), Some("DataFrame"));
+    }
+
+    #[test]
+    fn lsp_locations_parse_plain_locations_and_location_links() {
+        let response = json!([
+            {
+                "uri": "file:///C:/workspace/pkg/mod.py",
+                "range": {
+                    "start": { "line": 2, "character": 4 },
+                    "end": { "line": 2, "character": 9 }
+                }
+            },
+            {
+                "targetUri": "file:///C:/workspace/pkg/other.py",
+                "targetSelectionRange": {
+                    "start": { "line": 9, "character": 1 },
+                    "end": { "line": 9, "character": 6 }
+                }
+            }
+        ]);
+
+        let locations = parse_lsp_locations(&response);
+
+        assert_eq!(locations.len(), 2);
+        assert_eq!(
+            locations[0].path.as_deref(),
+            Some("C:/workspace/pkg/mod.py")
+        );
+        assert_eq!(locations[0].line, 3);
+        assert_eq!(locations[0].column, 5);
+        assert_eq!(
+            locations[1].path.as_deref(),
+            Some("C:/workspace/pkg/other.py")
+        );
+        assert_eq!(locations[1].line, 10);
+        assert_eq!(locations[1].column, 2);
+    }
+
+    #[test]
+    fn lsp_inlay_hints_parse_string_and_label_parts() {
+        let response = json!([
+            {
+                "position": { "line": 0, "character": 12 },
+                "label": ": int",
+                "kind": 1
+            },
+            {
+                "position": { "line": 1, "character": 8 },
+                "label": [{ "value": " -> " }, { "value": "str" }],
+                "kind": 2
+            }
+        ]);
+
+        let hints = parse_lsp_inlay_hints(&response);
+
+        assert_eq!(hints.len(), 2);
+        assert_eq!(hints[0].label, ": int");
+        assert_eq!(hints[0].line, 1);
+        assert_eq!(hints[0].column, 13);
+        assert_eq!(hints[1].label, " -> str");
+    }
+
+    #[test]
+    fn terminal_pty_shell_script_preserves_cwd_marker() {
+        let script = terminal_pty_shell_script("echo hello", Path::new("/workspace"));
+
+        assert!(script.contains("echo hello"));
+        assert!(script.contains(TERMINAL_CWD_MARKER));
+    }
+
+    #[test]
+    fn terminal_session_command_input_reports_status_and_cwd() {
+        let input = terminal_session_command_input("echo hello");
+
+        assert!(input.contains("echo hello"));
+        assert!(input.contains(TERMINAL_STATUS_MARKER));
+        assert!(input.contains(TERMINAL_CWD_MARKER));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn terminal_session_command_input_normalizes_venv_activation() {
+        let input = terminal_session_command_input(".venv/Scripts/activate");
+
+        assert!(input.contains(". '.\\.venv\\Scripts\\Activate.ps1'"));
+        assert!(input.contains(TERMINAL_STATUS_MARKER));
+        assert!(input.contains(TERMINAL_CWD_MARKER));
+    }
+
+    #[test]
+    fn terminal_pty_executes_short_command_without_hanging() {
+        let root =
+            env::temp_dir().join(format!("hematite-terminal-pty-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("create temp root");
+
+        #[cfg(target_os = "windows")]
+        let command = "Write-Output hematite-terminal-ok";
+        #[cfg(not(target_os = "windows"))]
+        let command = "printf 'hematite-terminal-ok\\n'";
+
+        let (success, output) =
+            run_terminal_command_in_pty(command, &root, &AgentCredentials::default())
+                .expect("run pty command");
+
+        assert!(success);
+        assert!(output.contains("hematite-terminal-ok"));
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn terminal_output_strips_ansi_sequences_before_display() {
+        let output = "\u{1b}[?25l\u{1b}[2Jhello\u{1b}]0;title\u{7}\r\n";
+
+        assert_eq!(strip_terminal_control_sequences(output), "hello\n");
+    }
+
+    #[test]
     fn lsp_hover_markup_uses_signature_as_title() {
         let hover = json!({
             "contents": {
@@ -11035,10 +12682,11 @@ Found 1 diagnostic";
 
         assert_eq!(item.kind, "ty signature");
         assert_eq!(item.title, "def cumsum(input: Tensor, dim: int) -> Tensor");
-        assert!(item
-            .detail
-            .as_deref()
-            .is_some_and(|value| value.contains("the input tensor")));
+        assert!(
+            item.detail
+                .as_deref()
+                .is_some_and(|value| value.contains("the input tensor"))
+        );
     }
 
     #[test]
@@ -11074,18 +12722,37 @@ Found 1 diagnostic";
     fn gemini_acp_args_include_selected_model() {
         assert_eq!(
             gemini_acp_args(Some("gemini-2.5-pro")),
-            vec!["--model", "gemini-2.5-pro", "--acp"]
+            vec![
+                "--model",
+                "gemini-2.5-pro",
+                "--approval-mode",
+                "default",
+                "--acp"
+            ]
         );
-        assert_eq!(gemini_acp_args(Some("  ")), vec!["--acp"]);
-        assert_eq!(gemini_acp_args(None), vec!["--acp"]);
+        assert_eq!(
+            gemini_acp_args(Some("  ")),
+            vec!["--approval-mode", "default", "--acp"]
+        );
+        assert_eq!(
+            gemini_acp_args(None),
+            vec!["--approval-mode", "default", "--acp"]
+        );
     }
 
     #[test]
     fn cli_agent_model_args_are_inserted_per_agent() {
         let claude_args = vec!["-p".to_string(), "{prompt}".to_string()];
         assert_eq!(
-            agent_args_with_selected_model("claude", &claude_args, Some("sonnet")),
-            vec!["--model", "sonnet", "-p", "{prompt}"]
+            agent_args_with_selected_model("claude", &claude_args, Some("sonnet"), None),
+            vec![
+                "--permission-mode",
+                "acceptEdits",
+                "--model",
+                "sonnet",
+                "-p",
+                "{prompt}"
+            ]
         );
 
         let kilo_args = vec![
@@ -11094,14 +12761,114 @@ Found 1 diagnostic";
             "{prompt}".to_string(),
         ];
         assert_eq!(
-            agent_args_with_selected_model("kilo", &kilo_args, Some("openai/gpt-5.5")),
+            agent_args_with_selected_model("kilo", &kilo_args, Some("openai/gpt-5.5"), None),
             vec!["run", "--model", "openai/gpt-5.5", "--auto", "{prompt}"]
         );
 
         assert_eq!(
-            agent_args_with_selected_model("claude", &claude_args, Some("  ")),
-            claude_args
+            agent_args_with_selected_model("claude", &claude_args, Some("  "), None),
+            vec!["--permission-mode", "acceptEdits", "-p", "{prompt}"]
         );
+    }
+
+    #[test]
+    fn cli_agent_permission_level_args_are_inserted_per_agent() {
+        let claude_args = vec!["-p".to_string(), "{prompt}".to_string()];
+        assert_eq!(
+            agent_args_with_selected_model("claude", &claude_args, Some("sonnet"), Some("plan")),
+            vec![
+                "--permission-mode",
+                "plan",
+                "--model",
+                "sonnet",
+                "-p",
+                "{prompt}"
+            ]
+        );
+
+        let gemini_args = vec!["-p".to_string(), "{prompt}".to_string()];
+        assert_eq!(
+            agent_args_with_selected_model(
+                "gemini",
+                &gemini_args,
+                Some("gemini-2.5-pro"),
+                Some("autoEdits")
+            ),
+            vec![
+                "--model",
+                "gemini-2.5-pro",
+                "--approval-mode",
+                "auto_edit",
+                "-p",
+                "{prompt}"
+            ]
+        );
+
+        let kilo_args = vec!["run".to_string(), "{prompt}".to_string()];
+        assert_eq!(
+            agent_args_with_selected_model(
+                "kilo",
+                &kilo_args,
+                Some("openai/gpt-5.5"),
+                Some("fullAuto")
+            ),
+            vec!["run", "--model", "openai/gpt-5.5", "--auto", "{prompt}"]
+        );
+    }
+
+    #[test]
+    fn codeshare_sessions_create_invites_and_track_local_participants() {
+        let mut state = CodeShareState::default();
+        let session = start_codeshare_session_in_state(
+            &mut state,
+            CodeShareSessionRequest {
+                title: "Pairing on approval UI".into(),
+                root: r"C:\workspace\hematite".into(),
+                active_file: Some(r"C:\workspace\hematite\src\App.tsx".into()),
+                agent_label: "OpenAI Codex".into(),
+                permission_level: "plan".into(),
+            },
+            1_700_000_000,
+        );
+
+        assert_eq!(session.title, "Pairing on approval UI");
+        assert_eq!(session.status, "hosting");
+        assert_eq!(session.participant_count, 1);
+        assert!(session.session_id.starts_with("codeshare-"));
+        assert!(session.invite_code.starts_with("CS-"));
+        assert_eq!(
+            session.invite_link,
+            format!("hematite://codeshare/{}", session.invite_code)
+        );
+
+        let joined = join_codeshare_session_in_state(
+            &mut state,
+            CodeShareJoinRequest {
+                invite_code: session.invite_code.clone(),
+            },
+            1_700_000_005,
+        )
+        .expect("invite should resolve");
+
+        assert_eq!(joined.session_id, session.session_id);
+        assert_eq!(joined.status, "joined");
+        assert_eq!(joined.participant_count, 2);
+        assert_eq!(joined.updated_at, 1_700_000_005);
+    }
+
+    #[test]
+    fn codeshare_join_rejects_unknown_invite_codes() {
+        let mut state = CodeShareState::default();
+        let error = join_codeshare_session_in_state(
+            &mut state,
+            CodeShareJoinRequest {
+                invite_code: "CS-MISSING".into(),
+            },
+            1_700_000_000,
+        )
+        .expect_err("unknown invites should fail");
+
+        assert!(error.contains("CodeShare invite was not found"));
     }
 
     #[test]
@@ -11215,6 +12982,41 @@ Found 1 diagnostic";
             diagnostics[0].message,
             "cannot find value `nope` in this scope"
         );
+    }
+
+    #[test]
+    fn rust_analyzer_publish_diagnostics_are_stored_by_uri() {
+        let shared = Arc::new(Mutex::new(RustAnalyzerLspSharedState::new(
+            r"C:\workspace".into(),
+        )));
+        let message = json!({
+            "jsonrpc": "2.0",
+            "method": "textDocument/publishDiagnostics",
+            "params": {
+                "uri": "file:///C:/workspace/src/main.rs",
+                "version": 7,
+                "diagnostics": [{
+                    "range": {
+                        "start": { "line": 1, "character": 16 },
+                        "end": { "line": 1, "character": 20 }
+                    },
+                    "severity": 1,
+                    "code": "E0425",
+                    "source": "rustc",
+                    "message": "cannot find value `nope` in this scope"
+                }]
+            }
+        });
+
+        handle_rust_analyzer_published_diagnostics(&shared, &message);
+
+        let state = shared.lock().expect("state");
+        let published = state
+            .published_diagnostics
+            .get("file:///C:/workspace/src/main.rs")
+            .expect("published diagnostics");
+        assert_eq!(published.version, Some(7));
+        assert_eq!(published.diagnostics.len(), 1);
     }
 
     #[test]
