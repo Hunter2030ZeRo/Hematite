@@ -7,3 +7,4 @@ target
 crates/hematite-ui-state/Cargo.lock
 *.log
 *.corrupt.bin
+src-tauri/binaries/
