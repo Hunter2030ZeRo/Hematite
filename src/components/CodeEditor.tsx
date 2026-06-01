@@ -5,9 +5,11 @@ import {
   type Extension,
   type Text,
 } from "@codemirror/state";
+import { HighlightStyle, syntaxHighlighting } from "@codemirror/language";
 import { lintGutter, setDiagnostics, type Diagnostic } from "@codemirror/lint";
 import { Decoration, EditorView, hoverTooltip, keymap } from "@codemirror/view";
 import { indentWithTab } from "@codemirror/commands";
+import { tags } from "@lezer/highlight";
 import { basicSetup } from "codemirror";
 import { createEffect, onCleanup, onMount } from "solid-js";
 
@@ -55,19 +57,114 @@ const semanticCompartment = new Compartment();
 const hoverCompartment = new Compartment();
 const lineWrappingCompartment = new Compartment();
 
+const hematiteSyntaxHighlighting = syntaxHighlighting(
+  HighlightStyle.define([
+    {
+      tag: [
+        tags.keyword,
+        tags.controlKeyword,
+        tags.definitionKeyword,
+        tags.moduleKeyword,
+        tags.modifier,
+        tags.operatorKeyword,
+        tags.self,
+        tags.null,
+        tags.atom,
+      ],
+      color: "#c792ea",
+      fontWeight: "600",
+    },
+    {
+      tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment],
+      color: "#8796ad",
+      fontStyle: "italic",
+    },
+    {
+      tag: [tags.string, tags.docString, tags.character, tags.attributeValue],
+      color: "#a6e3a1",
+    },
+    {
+      tag: [tags.number, tags.integer, tags.float, tags.bool],
+      color: "#ffd479",
+    },
+    {
+      tag: [tags.escape, tags.regexp, tags.special(tags.string)],
+      color: "#ffb4d8",
+    },
+    {
+      tag: [
+        tags.function(tags.variableName),
+        tags.definition(tags.function(tags.variableName)),
+        tags.function(tags.propertyName),
+      ],
+      color: "#86e1fc",
+      fontWeight: "600",
+    },
+    {
+      tag: [tags.className, tags.typeName, tags.tagName, tags.definition(tags.typeName)],
+      color: "#8cb8ff",
+      fontWeight: "600",
+    },
+    {
+      tag: [tags.namespace, tags.macroName, tags.labelName],
+      color: "#57dcc4",
+    },
+    {
+      tag: [tags.propertyName, tags.attributeName],
+      color: "#9adfff",
+    },
+    {
+      tag: [
+        tags.variableName,
+        tags.definition(tags.variableName),
+        tags.local(tags.variableName),
+        tags.standard(tags.variableName),
+        tags.special(tags.variableName),
+      ],
+      color: "#eef5ff",
+    },
+    {
+      tag: [
+        tags.operator,
+        tags.arithmeticOperator,
+        tags.logicOperator,
+        tags.compareOperator,
+        tags.definitionOperator,
+        tags.typeOperator,
+        tags.controlOperator,
+        tags.derefOperator,
+      ],
+      color: "#d7e1ef",
+    },
+    {
+      tag: [tags.punctuation, tags.separator, tags.bracket, tags.paren, tags.squareBracket, tags.brace],
+      color: "#b7c4d7",
+    },
+    {
+      tag: [tags.meta, tags.processingInstruction],
+      color: "#ffbe7a",
+    },
+    {
+      tag: tags.invalid,
+      color: "#ff6b8a",
+      textDecoration: "underline wavy rgba(255, 107, 138, 0.72)",
+    },
+  ])
+);
+
 const editorTheme = EditorView.theme(
   {
     "&": {
       height: "100%",
       "background-color": "#171b23",
       color: "#f4f8ff",
-      "font-family": '"JetBrains Mono", "IBM Plex Mono", Consolas, monospace',
-      "font-size": "14px",
-      "font-weight": "500",
+      "font-family": '"Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace',
+      "font-size": "15.5px",
+      "font-weight": "400",
       "-webkit-font-smoothing": "antialiased",
     },
     ".cm-scroller": {
-      "line-height": "1.55",
+      "line-height": "1.5",
       overflow: "auto",
       "overscroll-behavior": "contain",
     },
@@ -135,7 +232,7 @@ const editorTheme = EditorView.theme(
       color: "#eef4fb",
     },
     ".cm-tooltip-autocomplete > ul": {
-      "font-family": '"JetBrains Mono", "IBM Plex Mono", Consolas, monospace',
+      "font-family": '"Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace',
     },
     ".cm-tooltip-autocomplete > ul > li": {
       color: "#dfe8f5",
@@ -229,7 +326,7 @@ const editorTheme = EditorView.theme(
     },
     ".hematite-hover-title": {
       color: "#f3f8ff",
-      "font-family": '"JetBrains Mono", "IBM Plex Mono", Consolas, monospace',
+      "font-family": '"Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace',
       "font-size": "12px",
       "font-weight": "600",
       "line-height": "1.45",
@@ -460,6 +557,7 @@ export default function CodeEditor(props: CodeEditorProps) {
         doc: props.value,
         extensions: [
           basicSetup,
+          hematiteSyntaxHighlighting,
           editorTheme,
           lintGutter(),
           keymap.of([

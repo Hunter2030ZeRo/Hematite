@@ -1,6 +1,6 @@
 :root {
   color-scheme: dark;
-  font-family: "Segoe UI", "IBM Plex Sans", sans-serif;
+  font-family: "Segoe UI Variable", "Segoe UI", Inter, "IBM Plex Sans", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -52,7 +52,7 @@ button {
 
 code,
 pre {
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 }
 
 .workbench-shell {
@@ -81,6 +81,8 @@ pre {
 .command-actions,
 .status-pills,
 .inline-button-row,
+.share-action-row,
+.check-row,
 .agent-card-actions,
 .status-card-head,
 .inline-input-row,
@@ -525,7 +527,7 @@ pre {
 
 .utility-tabs {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   align-items: stretch;
   justify-content: stretch;
   gap: 0;
@@ -1348,6 +1350,26 @@ pre {
   min-height: 36px;
 }
 
+.approval-actions.compact .command-button {
+  min-height: 30px;
+}
+
+.pending-approval-bar {
+  display: grid;
+  gap: 10px;
+  border: 1px solid rgba(240, 198, 116, 0.32);
+  border-left: 3px solid var(--warning);
+  border-radius: 6px;
+  background: rgba(240, 198, 116, 0.08);
+  padding: 10px;
+}
+
+.pending-approval-copy {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+
 .chat-details {
   margin-top: 10px;
 }
@@ -1414,10 +1436,19 @@ pre {
   font-size: 0.78rem;
 }
 
-.agent-model-bar {
+.agent-run-controls {
   display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
   padding: 8px 0 2px;
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.permission-note {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 0.78rem;
+  line-height: 1.45;
 }
 
 .model-select-field.prominent,
@@ -1441,6 +1472,47 @@ pre {
   height: 30px;
   padding: 4px 28px 4px 8px;
   color: var(--text);
+}
+
+.share-card {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.share-option-list {
+  display: grid;
+  gap: 8px;
+}
+
+.codeshare-grid {
+  display: grid;
+  gap: 8px;
+}
+
+.check-row {
+  justify-content: space-between;
+  min-height: 30px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.check-row input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--accent);
+}
+
+.share-action-row {
+  flex-wrap: wrap;
+}
+
+.inline-note {
+  padding: 0;
+}
+
+.share-preview {
+  max-height: 360px;
 }
 
 .tooling-button-grid {
@@ -1644,7 +1716,7 @@ pre {
   gap: 8px;
   margin-bottom: 10px;
   color: var(--text);
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   overflow-wrap: anywhere;
 }
 
@@ -1676,7 +1748,7 @@ pre {
 
 .terminal-prompt {
   color: var(--accent);
-  font-family: "JetBrains Mono", Consolas, monospace;
+  font-family: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
   font-size: 0.82rem;
   white-space: nowrap;
 }
@@ -1909,10 +1981,8 @@ pre {
   place-items: center;
   border-left: 2px solid transparent;
   color: #858585;
-  font-family: "JetBrains Mono", Consolas, monospace;
-  font-size: 0.72rem;
-  font-weight: 700;
   cursor: pointer;
+  padding: 0;
 }
 
 .activity-item:hover,
@@ -1926,6 +1996,22 @@ pre {
 
 .activity-item:last-child {
   margin-top: auto;
+}
+
+.activity-icon {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.activity-terminal {
+  font-family: "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 700;
 }
 
 .activity-badge {
@@ -2082,7 +2168,7 @@ pre {
 
 .utility-tabs {
   display: grid;
-  grid-template-columns: repeat(5, minmax(0, 1fr));
+  grid-template-columns: repeat(6, minmax(0, 1fr));
   overflow: hidden;
 }
 
