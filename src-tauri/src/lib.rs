@@ -1,3 +1,5 @@
+mod modules;
+
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use rfd::FileDialog;
 use serde::{Deserialize, Serialize};
@@ -12033,7 +12035,12 @@ pub fn run() {
             analyze_rust_diagnostics,
             install_missing_python_imports,
             run_python_tooling_action,
-            run_rust_tooling_action
+            run_rust_tooling_action,
+            modules::list_modules,
+            modules::install_module,
+            modules::set_module_enabled,
+            modules::uninstall_module,
+            modules::execute_module_command
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

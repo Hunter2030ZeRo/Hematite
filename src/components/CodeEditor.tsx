@@ -108,25 +108,25 @@ const hematiteSyntaxHighlighting = syntaxHighlighting(
         tags.null,
         tags.atom,
       ],
-      color: "#c792ea",
+      color: "#c7b8d8",
       fontWeight: "600",
     },
     {
       tag: [tags.comment, tags.lineComment, tags.blockComment, tags.docComment],
-      color: "#8796ad",
+      color: "#777d86",
       fontStyle: "italic",
     },
     {
       tag: [tags.string, tags.docString, tags.character, tags.attributeValue],
-      color: "#a6e3a1",
+      color: "#afc8b3",
     },
     {
       tag: [tags.number, tags.integer, tags.float, tags.bool],
-      color: "#ffd479",
+      color: "#d2c49e",
     },
     {
       tag: [tags.escape, tags.regexp, tags.special(tags.string)],
-      color: "#ffb4d8",
+      color: "#d3abb7",
     },
     {
       tag: [
@@ -134,21 +134,21 @@ const hematiteSyntaxHighlighting = syntaxHighlighting(
         tags.definition(tags.function(tags.variableName)),
         tags.function(tags.propertyName),
       ],
-      color: "#86e1fc",
+      color: "#b7d1dd",
       fontWeight: "600",
     },
     {
       tag: [tags.className, tags.typeName, tags.tagName, tags.definition(tags.typeName)],
-      color: "#8cb8ff",
+      color: "#b4c5dc",
       fontWeight: "600",
     },
     {
       tag: [tags.namespace, tags.macroName, tags.labelName],
-      color: "#57dcc4",
+      color: "#a8cabe",
     },
     {
       tag: [tags.propertyName, tags.attributeName],
-      color: "#9adfff",
+      color: "#c0cfd6",
     },
     {
       tag: [
@@ -158,7 +158,7 @@ const hematiteSyntaxHighlighting = syntaxHighlighting(
         tags.standard(tags.variableName),
         tags.special(tags.variableName),
       ],
-      color: "#eef5ff",
+      color: "#e6e8eb",
     },
     {
       tag: [
@@ -171,20 +171,20 @@ const hematiteSyntaxHighlighting = syntaxHighlighting(
         tags.controlOperator,
         tags.derefOperator,
       ],
-      color: "#d7e1ef",
+      color: "#c2c5ca",
     },
     {
       tag: [tags.punctuation, tags.separator, tags.bracket, tags.paren, tags.squareBracket, tags.brace],
-      color: "#b7c4d7",
+      color: "#969ba3",
     },
     {
       tag: [tags.meta, tags.processingInstruction],
-      color: "#ffbe7a",
+      color: "#d4b5a3",
     },
     {
       tag: tags.invalid,
-      color: "#ff6b8a",
-      textDecoration: "underline wavy rgba(255, 107, 138, 0.72)",
+      color: "#d69aa4",
+      textDecoration: "underline wavy rgba(214, 154, 164, 0.72)",
     },
   ])
 );
@@ -193,8 +193,8 @@ const editorTheme = EditorView.theme(
   {
     "&": {
       height: "100%",
-      "background-color": "#171b23",
-      color: "#f4f8ff",
+      "background-color": "#0e1013",
+      color: "#e7e9ec",
       "font-family": '"Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace',
       "font-size": "15.5px",
       "font-weight": "400",
@@ -207,14 +207,14 @@ const editorTheme = EditorView.theme(
     },
     ".cm-content": {
       padding: "16px 0 48px",
-      "caret-color": "#9ecbff",
+      "caret-color": "#f0f1f3",
     },
     ".cm-line": {
       padding: "0 20px",
     },
     ".cm-gutters": {
-      "background-color": "#11151d",
-      color: "#95a6be",
+      "background-color": "#0a0c0f",
+      color: "#686d75",
       border: "none",
       "padding-right": "10px",
     },
@@ -223,64 +223,64 @@ const editorTheme = EditorView.theme(
       "padding-right": "12px",
     },
     ".cm-activeLine": {
-      "background-color": "rgba(143, 221, 255, 0.1)",
+      "background-color": "rgba(255, 255, 255, 0.035)",
     },
     ".cm-activeLineGutter": {
-      "background-color": "#11151d",
-      color: "#f6faff",
+      "background-color": "#0a0c0f",
+      color: "#cfd2d6",
     },
     ".cm-selectionBackground, &.cm-focused .cm-selectionBackground": {
-      "background-color": "rgba(92, 159, 255, 0.42)",
+      "background-color": "rgba(174, 188, 210, 0.22)",
     },
     ".cm-selectionMatch": {
-      "background-color": "rgba(92, 159, 255, 0.2)",
+      "background-color": "rgba(174, 188, 210, 0.11)",
     },
     ".cm-cursor, .cm-dropCursor": {
-      "border-left-color": "#b4d5ff",
+      "border-left-color": "#eceef1",
       "border-left-width": "2px",
     },
     ".cm-matchingBracket": {
-      "background-color": "rgba(166, 218, 149, 0.14)",
-      color: "#d8f5bf",
-      outline: "1px solid rgba(166, 218, 149, 0.45)",
+      "background-color": "rgba(183, 209, 221, 0.1)",
+      color: "#dce6ea",
+      outline: "1px solid rgba(183, 209, 221, 0.35)",
     },
     ".cm-nonmatchingBracket": {
-      "background-color": "rgba(255, 122, 182, 0.12)",
-      color: "#ff9fc8",
-      outline: "1px solid rgba(255, 122, 182, 0.4)",
+      "background-color": "rgba(214, 154, 164, 0.1)",
+      color: "#d9a4aa",
+      outline: "1px solid rgba(214, 154, 164, 0.38)",
     },
     ".cm-tooltip": {
-      "background-color": "#222a36",
+      "background-color": "#171a1f",
       border: "1px solid rgba(255,255,255,0.11)",
-      color: "#eef4fb",
+      color: "#e2e5e9",
       "box-shadow": "0 10px 30px rgba(0, 0, 0, 0.34)",
       "max-width": "min(720px, 72vw)",
       "max-height": "min(440px, 56vh)",
       overflow: "hidden",
     },
     ".cm-panels": {
-      "background-color": "#10151d",
-      color: "#e4edf8",
+      "background-color": "#0d0f12",
+      color: "#d9dce0",
       border: "none",
     },
     ".cm-tooltip.cm-tooltip-autocomplete": {
-      "background-color": "#1b2330",
+      "background-color": "#15181d",
       border: "1px solid rgba(255,255,255,0.1)",
-      color: "#eef4fb",
+      color: "#e2e5e9",
     },
     ".cm-tooltip-autocomplete > ul": {
       "font-family": '"Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace',
     },
     ".cm-tooltip-autocomplete > ul > li": {
-      color: "#dfe8f5",
+      color: "#d5d8dd",
       padding: "6px 10px",
     },
     ".cm-tooltip-autocomplete > ul > li[aria-selected]": {
-      "background-color": "rgba(87, 220, 196, 0.18)",
-      color: "#f8fbff",
+      "background-color": "rgba(255, 255, 255, 0.09)",
+      color: "#f3f4f5",
     },
     ".cm-completionMatchedText": {
-      color: "#86e1fc",
+      color: "#b7d1dd",
       "text-decoration": "none",
       "font-weight": "700",
     },
@@ -291,71 +291,71 @@ const editorTheme = EditorView.theme(
       "margin-left": "6px",
       padding: "0 5px",
       "border-radius": "4px",
-      "background-color": "rgba(143, 221, 255, 0.1)",
-      color: "#9fb5cf",
+      "background-color": "rgba(255, 255, 255, 0.055)",
+      color: "#969ca5",
       "font-size": "12px",
       "font-style": "normal",
       "vertical-align": "baseline",
     },
     ".cm-content .cm-semantic-keyword, .cm-content .cm-semantic-keyword *, .cm-content .cm-semantic-modifier, .cm-content .cm-semantic-modifier *": {
-      color: "#ff7ab2 !important",
+      color: "#c7b8d8 !important",
     },
     ".cm-content .cm-semantic-string, .cm-content .cm-semantic-string *": {
-      color: "#a6e3a1 !important",
+      color: "#afc8b3 !important",
     },
     ".cm-content .cm-semantic-number, .cm-content .cm-semantic-number *": {
-      color: "#ffd479 !important",
+      color: "#d2c49e !important",
     },
     ".cm-content .cm-semantic-operator, .cm-content .cm-semantic-operator *": {
-      color: "#d7e1ef !important",
+      color: "#c2c5ca !important",
     },
     ".cm-content .cm-semantic-comment, .cm-content .cm-semantic-comment *": {
-      color: "#8ea4c1 !important",
+      color: "#777d86 !important",
       "font-style": "italic",
     },
     ".cm-content .cm-semantic-namespace, .cm-content .cm-semantic-module, .cm-content .cm-semantic-namespace *, .cm-content .cm-semantic-module *": {
-      color: "#57dcc4 !important",
+      color: "#a8cabe !important",
     },
     ".cm-content .cm-semantic-function, .cm-content .cm-semantic-function *, .cm-content .cm-semantic-functionDefinition, .cm-content .cm-semantic-functionDefinition *, .cm-content .cm-semantic-methodDefinition, .cm-content .cm-semantic-methodDefinition *":
       {
-        color: "#86e1fc !important",
+        color: "#b7d1dd !important",
       },
     ".cm-content .cm-semantic-method, .cm-content .cm-semantic-method *, .cm-content .cm-semantic-functionCall, .cm-content .cm-semantic-functionCall *, .cm-content .cm-semantic-methodCall, .cm-content .cm-semantic-methodCall *":
       {
-        color: "#ffd479 !important",
+        color: "#d2c49e !important",
       },
     ".cm-content .cm-semantic-macro, .cm-content .cm-semantic-macro *, .cm-content .cm-semantic-attribute, .cm-content .cm-semantic-attribute *":
       {
-        color: "#c792ea !important",
+        color: "#c7b8d8 !important",
       },
     ".cm-content .cm-semantic-class, .cm-content .cm-semantic-class *, .cm-content .cm-semantic-type, .cm-content .cm-semantic-type *, .cm-content .cm-semantic-classDefinition, .cm-content .cm-semantic-classDefinition *, .cm-content .cm-semantic-classReference, .cm-content .cm-semantic-classReference *":
       {
-        color: "#8cb8ff !important",
+        color: "#b4c5dc !important",
       },
     ".cm-content .cm-semantic-struct, .cm-content .cm-semantic-struct *, .cm-content .cm-semantic-enum, .cm-content .cm-semantic-enum *, .cm-content .cm-semantic-enumMember, .cm-content .cm-semantic-enumMember *, .cm-content .cm-semantic-builtinType, .cm-content .cm-semantic-builtinType *":
       {
-        color: "#8cb8ff !important",
+        color: "#b4c5dc !important",
       },
     ".cm-content .cm-semantic-lifetime, .cm-content .cm-semantic-lifetime *": {
-      color: "#ffbe7a !important",
+      color: "#d4b5a3 !important",
     },
     ".cm-content .cm-semantic-unresolvedReference, .cm-content .cm-semantic-unresolvedReference *":
       {
-        color: "#ff6b8a !important",
-        "text-decoration": "underline wavy rgba(255, 107, 138, 0.72)",
+        color: "#d69aa4 !important",
+        "text-decoration": "underline wavy rgba(214, 154, 164, 0.72)",
       },
     ".cm-content .cm-semantic-parameter, .cm-content .cm-semantic-parameter *": {
-      color: "#ffbe7a !important",
+      color: "#d4b5a3 !important",
     },
     ".cm-content .cm-semantic-variableDefinition, .cm-content .cm-semantic-variableDefinition *":
       {
-        color: "#ffd29c !important",
+        color: "#d7c3ab !important",
       },
     ".cm-content .cm-semantic-variable, .cm-content .cm-semantic-variable *, .cm-content .cm-semantic-identifier, .cm-content .cm-semantic-identifier *": {
-      color: "#eef5ff !important",
+      color: "#e6e8eb !important",
     },
     ".cm-content .cm-semantic-property, .cm-content .cm-semantic-property *": {
-      color: "#9adfff !important",
+      color: "#c0cfd6 !important",
     },
     ".hematite-hover": {
       display: "grid",
@@ -372,7 +372,7 @@ const editorTheme = EditorView.theme(
       "min-width": 0,
     },
     ".hematite-hover-title": {
-      color: "#f3f8ff",
+      color: "#e8eaed",
       "font-family": '"Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace',
       "font-size": "12px",
       "font-weight": "600",
@@ -381,14 +381,14 @@ const editorTheme = EditorView.theme(
       "overflow-wrap": "anywhere",
     },
     ".hematite-hover-kind": {
-      color: "#7cc9ff",
+      color: "#b7c8dc",
       "font-size": "11px",
       "font-weight": "700",
       "letter-spacing": "0.04em",
       "text-transform": "uppercase",
     },
     ".hematite-hover-detail": {
-      color: "#c8d7ea",
+      color: "#c8ccd2",
       "font-family": '"IBM Plex Sans", "Segoe UI", sans-serif',
       "font-size": "12px",
       "line-height": "1.5",
@@ -396,7 +396,7 @@ const editorTheme = EditorView.theme(
       "overflow-wrap": "anywhere",
     },
     ".hematite-hover-source": {
-      color: "#8ea4c1",
+      color: "#858b94",
       "font-family": '"IBM Plex Sans", "Segoe UI", sans-serif',
       "font-size": "11px",
       "line-height": "1.4",

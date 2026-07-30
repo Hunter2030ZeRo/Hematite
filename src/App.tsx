@@ -515,7 +515,7 @@ type ChatMessage = {
   approval?: AgentApproval;
 };
 
-type UtilityTab = "chat" | "access" | "share" | "project" | "problems" | "outline";
+type UtilityTab = "chat" | "access" | "share" | "project" | "problems" | "outline" | "modules";
 
 type CredentialsForm = {
   openaiApiKey: string;
@@ -552,6 +552,7 @@ type AgentDefinition = {
 };
 
 const LazyCodeEditor = lazy(() => import("./components/CodeEditor"));
+const ModulesPanel = lazy(() => import("./components/ModulesPanel"));
 
 const AGENTS: AgentDefinition[] = [
   {
@@ -727,7 +728,15 @@ function agentPermissionNote(agent: AgentDefinition, level: AgentPermissionLevel
 }
 
 function ActivityIcon(props: {
-  kind: "files" | "agents" | "access" | "codeshare" | "project" | "problems" | "outline";
+  kind:
+    | "files"
+    | "agents"
+    | "access"
+    | "codeshare"
+    | "project"
+    | "problems"
+    | "outline"
+    | "modules";
 }) {
   switch (props.kind) {
     case "files":
@@ -792,6 +801,15 @@ function ActivityIcon(props: {
           <circle cx="4" cy="6" r="1" />
           <circle cx="4" cy="12" r="1" />
           <circle cx="4" cy="18" r="1" />
+        </svg>
+      );
+    case "modules":
+      return (
+        <svg class="activity-icon" viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m12 3.5 7 3.8v9.4l-7 3.8-7-3.8V7.3z" />
+          <path d="m5 7.3 7 4 7-4" />
+          <path d="M12 11.3v9.2" />
+          <path d="m8.5 5.4 7 3.8" />
         </svg>
       );
   }
@@ -4606,6 +4624,16 @@ export default function App() {
           </button>
           <button
             type="button"
+            class={`activity-item${utilityTab() === "modules" ? " active" : ""}`}
+            title="Modules"
+            aria-label="Modules"
+            aria-pressed={utilityTab() === "modules"}
+            onClick={() => setUtilityTab("modules")}
+          >
+            <ActivityIcon kind="modules" />
+          </button>
+          <button
+            type="button"
             class={`activity-item${isTerminalVisible() ? " active" : ""}`}
             title="Terminal"
             aria-label="Terminal"
@@ -4877,6 +4905,14 @@ export default function App() {
               onClick={() => setUtilityTab("outline")}
             >
               Outline
+            </button>
+            <button
+              type="button"
+              class={`utility-tab${utilityTab() === "modules" ? " active" : ""}`}
+              aria-pressed={utilityTab() === "modules"}
+              onClick={() => setUtilityTab("modules")}
+            >
+              Modules
             </button>
           </div>
 
@@ -6492,6 +6528,12 @@ export default function App() {
                   {compactContext() || "Context preview will populate from the active file."}
                 </pre>
               </section>
+            </Show>
+
+            <Show when={utilityTab() === "modules"}>
+              <Suspense fallback={<div class="empty-note">Loading module manager...</div>}>
+                <ModulesPanel onStatus={setStatus} />
+              </Suspense>
             </Show>
           </div>
         </aside>

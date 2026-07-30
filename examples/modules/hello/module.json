@@ -1,0 +1,20 @@
+{
+  "manifestVersion": 1,
+  "abiVersion": 1,
+  "publisher": "example",
+  "name": "hello",
+  "displayName": "Hello WASM Module",
+  "version": "0.1.0",
+  "description": "Minimal Hematite ABI v1 command module.",
+  "entry": "module.wasm",
+  "activationEvents": ["onCommand:example.hello"],
+  "contributes": {
+    "commands": [
+      {
+        "command": "example.hello",
+        "title": "Hello from WASM"
+      }
+    ]
+  },
+  "capabilities": ["log"]
+}
